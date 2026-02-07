@@ -1,102 +1,113 @@
 /**
- * bd-identity plugin: Session-aware agent identity bead management.
+ * bd-identity plugin: Session-aware agent identity + project bead management.
  *
- * Security model:
- * - The gateway injects sessionKey and agentId into the tool context.
- * - The agent never provides or controls its identity — the platform does.
- * - Identity beads are discovered by matching labels: "agent-identity" + a
- *   session-derived label.
- * - Write operations are scoped to the agent's own bead only.
+ * Provides two tools:
  *
- * This replaces the bash bd-identity script with a tamper-proof tool.
+ * bd_identity — Manage your own identity bead (personality, context, focus).
+ *   Gateway injects sessionKey/agentId. Agent cannot access other agents' beads.
+ *   Commands: whoami, show, comment, edit, comments, prune, init
+ *
+ * bd_project — Full bead access EXCEPT identity beads.
+ *   For agents that need to manage project/task beads but must not tamper
+ *   with any agent's identity. Checks the "agent-identity" label before writes.
+ *   Commands: show, list, comment, edit, create, close, ready, query
  */
 
 import { execSync } from "child_process";
 
 const IDENTITY_LABEL = "agent-identity";
 
-/**
- * Derive a bead label from a session key.
- *
- * Examples:
- *   "agent:discord:discord:1467935902931222589" → tries channel ID match
- *   "agent:main:main" → "main-session"
- *   "agent:devops:subagent:abc123" → "devops"
- *   "agent:main:discord:channel:1467935902931222589" → tries channel ID match
- */
+// ─── Shared helpers ───────────────────────────────────────────────
+
+function bd(args: string, timeoutMs = 10000): string {
+  try {
+    return execSync(`bd ${args}`, {
+      encoding: "utf-8",
+      timeout: timeoutMs,
+    }).trim();
+  } catch (e: any) {
+    const msg = e.stderr?.trim() || e.message;
+    throw new Error(`bd failed: ${msg}`);
+  }
+}
+
+function isIdentityBead(beadId: string): boolean {
+  try {
+    const result = bd(`label list ${beadId}`);
+    return result.includes(IDENTITY_LABEL);
+  } catch {
+    return false;
+  }
+}
+
+function textResult(text: string) {
+  return { content: [{ type: "text" as const, text }] };
+}
+
+function errorResult(msg: string) {
+  return { content: [{ type: "text" as const, text: `Error: ${msg}` }] };
+}
+
+// ─── Identity bead discovery ──────────────────────────────────────
+
 function sessionKeyToLabels(sessionKey: string, agentId?: string): string[] {
   const labels: string[] = [];
-
-  // Extract agent name from session key (second segment)
   const parts = sessionKey.split(":");
+
   if (parts.length >= 2) {
     const agent = parts[1];
     if (agent === "main" && parts[2] === "main") {
       labels.push("main-session");
     }
 
-    // Discord channel sessions: look for channel ID
-    // Patterns: agent:X:discord:CHANNEL_ID or agent:X:discord:channel:CHANNEL_ID
+    // Discord: find channel ID (long numeric string)
     const discordIdx = parts.indexOf("discord");
     if (discordIdx >= 0) {
-      // The channel ID is usually the last numeric segment
       for (let i = parts.length - 1; i > discordIdx; i--) {
         if (/^\d{15,}$/.test(parts[i])) {
-          labels.push(parts[i]); // raw channel ID for flexible matching
+          labels.push(parts[i]);
           break;
         }
       }
     }
   }
 
-  // Also try the agentId directly if provided
-  if (agentId) {
-    labels.push(agentId);
-  }
-
+  if (agentId) labels.push(agentId);
   return labels;
 }
 
-/**
- * Find an identity bead by searching for label intersections.
- */
-function findBead(searchLabels: string[]): string | null {
-  // Strategy 1: Try each label with agent-identity
+function findIdentityBead(searchLabels: string[]): string | null {
+  // Try direct label match first
   for (const label of searchLabels) {
     try {
-      const result = execSync(
-        `bd query "label=${IDENTITY_LABEL} AND label=${label}" --json 2>/dev/null`,
-        { encoding: "utf-8", timeout: 5000 },
-      ).trim();
-
+      const result = bd(
+        `query "label=${IDENTITY_LABEL} AND label=${label}" --json`,
+      );
       const beads = JSON.parse(result);
       if (Array.isArray(beads) && beads.length > 0 && beads[0].id) {
         return beads[0].id;
       }
     } catch {
-      // Try next label
+      // next
     }
   }
 
-  // Strategy 2: For channel IDs, search all identity beads and match by ID in labels
+  // For channel IDs, search all identity beads and match by substring
   for (const label of searchLabels) {
     if (/^\d{15,}$/.test(label)) {
       try {
-        const result = execSync(
-          `bd query "label=${IDENTITY_LABEL}" --json 2>/dev/null`,
-          { encoding: "utf-8", timeout: 5000 },
-        ).trim();
-
+        const result = bd(`query "label=${IDENTITY_LABEL}" --json`);
         const beads = JSON.parse(result);
         if (Array.isArray(beads)) {
           const match = beads.find(
             (b: any) =>
-              Array.isArray(b.labels) && b.labels.some((l: string) => l.includes(label)),
+              Array.isArray(b.labels) &&
+              b.labels.some((l: string) => l.includes(label)),
           );
           if (match?.id) return match.id;
         }
       } catch {
-        // Fall through
+        // fall through
       }
     }
   }
@@ -104,20 +115,14 @@ function findBead(searchLabels: string[]): string | null {
   return null;
 }
 
-/**
- * Create an identity bead with the given label.
- */
-function createBead(label: string): string | null {
+function createIdentityBead(label: string): string | null {
   try {
-    const id = execSync(
-      `bd q "Agent Identity: ${label}" --labels "${IDENTITY_LABEL},${label},session-context" 2>/dev/null`,
-      { encoding: "utf-8", timeout: 5000 },
-    ).trim();
-
+    const id = bd(
+      `q "Agent Identity: ${label}" --labels "${IDENTITY_LABEL},${label},session-context"`,
+    );
     if (id) {
-      execSync(
-        `bd update "${id}" --description "Identity bead for '${label}'. Auto-created by bd-identity plugin." 2>/dev/null`,
-        { timeout: 5000 },
+      bd(
+        `update "${id}" --description "Identity bead for '${label}'. Auto-created by bd-identity plugin."`,
       );
     }
     return id || null;
@@ -126,177 +131,241 @@ function createBead(label: string): string | null {
   }
 }
 
-/**
- * Run a bd command and return output.
- */
-function bd(args: string): string {
-  try {
-    return execSync(`bd ${args}`, { encoding: "utf-8", timeout: 10000 }).trim();
-  } catch (e: any) {
-    throw new Error(`bd command failed: ${e.message}`);
-  }
-}
+// ─── bd_identity tool ─────────────────────────────────────────────
 
-export default function register(api: any) {
-  // Use ToolFactory pattern to get session context
+function registerIdentityTool(api: any) {
   api.registerTool(
     (ctx: {
       sessionKey?: string;
       agentId?: string;
-      config?: any;
       sandboxed?: boolean;
     }) => {
       const sessionKey = ctx.sessionKey;
       const agentId = ctx.agentId;
-
-      if (!sessionKey) {
-        api.logger.warn("bd-identity: no sessionKey in context, tool will be limited");
-      }
+      const labels = sessionKey ? sessionKeyToLabels(sessionKey, agentId) : [];
 
       return {
         name: "bd_identity",
-        description: `Manage your agent identity bead. Your identity is automatically resolved from your session — you cannot access other agents' identity beads.
+        description: `Manage your agent identity bead. Your identity is automatically resolved from your session — you cannot access other agents' beads.
 
 Commands:
 - whoami: Show your session key, agent ID, and identity bead
 - show: Display your identity bead content
-- comment: Add a comment to your identity bead (for personality notes, preferences, context)
-- init: Find or create your identity bead (run once on first use)
+- comment: Add a comment to your identity bead
+- edit: Update your identity bead description (replaces entire description)
+- comments: List all comments on your identity bead
+- init: Find or create your identity bead
 
-Your identity bead persists across sessions and stores your personality, preferences, and context.`,
+Keep your bead lean: current focus, active tasks, recent decisions, personality. Move long-term knowledge to memory files.`,
         parameters: {
           type: "object",
           properties: {
             command: {
               type: "string",
-              enum: ["whoami", "show", "comment", "init"],
+              enum: ["whoami", "show", "comment", "edit", "comments", "init"],
               description: "The identity command to run",
             },
             text: {
               type: "string",
-              description: "Text for the comment command",
+              description: "Text for comment or edit commands",
             },
           },
           required: ["command"],
         },
 
-        async execute(_toolCallId: string, params: { command: string; text?: string }) {
+        async execute(_id: string, params: { command: string; text?: string }) {
           const { command, text } = params;
 
           if (!sessionKey) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: "Error: No session context available. Cannot resolve identity.",
-                },
-              ],
-            };
+            return errorResult("No session context. Cannot resolve identity.");
           }
 
-          // Derive search labels from session key
-          const labels = sessionKeyToLabels(sessionKey, agentId);
+          const beadId = findIdentityBead(labels);
 
           switch (command) {
-            case "whoami": {
-              const beadId = findBead(labels);
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: [
-                      `Session Key: ${sessionKey}`,
-                      `Agent ID:    ${agentId ?? "unknown"}`,
-                      `Bead ID:     ${beadId ?? "<not found — run init>"}`,
-                      `Labels:      ${labels.join(", ")}`,
-                      `Sandboxed:   ${ctx.sandboxed ?? "unknown"}`,
-                    ].join("\n"),
-                  },
-                ],
-              };
-            }
+            case "whoami":
+              return textResult(
+                [
+                  `Session Key: ${sessionKey}`,
+                  `Agent ID:    ${agentId ?? "unknown"}`,
+                  `Bead ID:     ${beadId ?? "<not found — run init>"}`,
+                  `Labels:      ${labels.join(", ")}`,
+                  `Sandboxed:   ${ctx.sandboxed ?? "unknown"}`,
+                ].join("\n"),
+              );
 
-            case "show": {
-              const beadId = findBead(labels);
-              if (!beadId) {
-                return {
-                  content: [
-                    {
-                      type: "text",
-                      text: `No identity bead found for session "${sessionKey}". Run 'init' to create one.`,
-                    },
-                  ],
-                };
-              }
-              const output = bd(`show ${beadId}`);
-              return { content: [{ type: "text", text: output }] };
-            }
+            case "show":
+              if (!beadId) return errorResult(`No identity bead found. Run 'init' first.`);
+              return textResult(bd(`show ${beadId}`));
 
-            case "comment": {
-              if (!text) {
-                return {
-                  content: [{ type: "text", text: "Error: 'text' parameter required for comment." }],
-                };
+            case "comment":
+              if (!text) return errorResult("'text' parameter required for comment.");
+              if (!beadId) return errorResult("No identity bead found. Run 'init' first.");
+              bd(`comments add ${beadId} "${text.replace(/"/g, '\\"')}"`);
+              return textResult(`Comment added to ${beadId}`);
+
+            case "edit":
+              if (!text) return errorResult("'text' parameter required for edit.");
+              if (!beadId) return errorResult("No identity bead found. Run 'init' first.");
+              bd(`update ${beadId} --description "${text.replace(/"/g, '\\"')}"`);
+              return textResult(`Description updated on ${beadId}`);
+
+            case "comments": {
+              if (!beadId) return errorResult("No identity bead found. Run 'init' first.");
+              try {
+                const output = bd(`comments ${beadId}`);
+                return textResult(output || "No comments.");
+              } catch {
+                return textResult("No comments.");
               }
-              const beadId = findBead(labels);
-              if (!beadId) {
-                return {
-                  content: [
-                    {
-                      type: "text",
-                      text: `No identity bead found. Run 'init' first.`,
-                    },
-                  ],
-                };
-              }
-              const output = bd(`comments add ${beadId} "${text.replace(/"/g, '\\"')}"`);
-              return {
-                content: [{ type: "text", text: output || `Comment added to ${beadId}` }],
-              };
             }
 
             case "init": {
-              const existing = findBead(labels);
-              if (existing) {
-                return {
-                  content: [
-                    { type: "text", text: `Identity bead already exists: ${existing}` },
-                  ],
-                };
-              }
-              // Use the most specific label for creation
+              if (beadId) return textResult(`Identity bead already exists: ${beadId}`);
               const createLabel =
                 labels.find((l) => l.startsWith("discord-")) ||
                 labels.find((l) => !l.match(/^\d+$/)) ||
                 agentId ||
                 "unknown";
-              const newId = createBead(createLabel);
-              if (!newId) {
-                return {
-                  content: [{ type: "text", text: "Failed to create identity bead." }],
-                };
-              }
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: `Created identity bead: ${newId} (label: ${createLabel})`,
-                  },
-                ],
-              };
+              const newId = createIdentityBead(createLabel);
+              if (!newId) return errorResult("Failed to create identity bead.");
+              return textResult(`Created identity bead: ${newId} (label: ${createLabel})`);
             }
 
             default:
-              return {
-                content: [
-                  { type: "text", text: `Unknown command: ${command}. Use: whoami, show, comment, init` },
-                ],
-              };
+              return errorResult(`Unknown command: ${command}`);
           }
         },
       };
     },
   );
+}
 
-  api.logger.info("bd-identity: plugin registered");
+// ─── bd_project tool ──────────────────────────────────────────────
+
+function registerProjectTool(api: any) {
+  api.registerTool(
+    (ctx: {
+      sessionKey?: string;
+      agentId?: string;
+    }) => {
+      return {
+        name: "bd_project",
+        description: `Manage project and task beads. Full bead access EXCEPT agent identity beads — writes to identity beads are blocked.
+
+Commands:
+- show <id>: Show a bead
+- list: List open beads
+- ready: Show beads ready to work on
+- query <expr>: Search beads with a query expression
+- comment <id> <text>: Add a comment to a bead
+- edit <id> <text>: Update a bead's description
+- create <title>: Create a new bead
+- close <id>: Close a bead
+- label <id> <label>: Add a label to a bead (cannot add 'agent-identity')
+- sync: Sync bead changes
+
+Use this for project work, task tracking, and collaboration. Identity beads are managed exclusively through bd_identity.`,
+        parameters: {
+          type: "object",
+          properties: {
+            command: {
+              type: "string",
+              enum: ["show", "list", "ready", "query", "comment", "edit", "create", "close", "label", "sync"],
+              description: "The project command to run",
+            },
+            id: {
+              type: "string",
+              description: "Bead ID (for show, comment, edit, close, label)",
+            },
+            text: {
+              type: "string",
+              description: "Text content (for comment, edit, create, query, label)",
+            },
+          },
+          required: ["command"],
+        },
+
+        async execute(_toolCallId: string, params: { command: string; id?: string; text?: string }) {
+          const { command, id, text } = params;
+
+          // Write commands that target a specific bead — check identity protection
+          const writeCommands = ["comment", "edit", "close", "label"];
+          if (writeCommands.includes(command) && id) {
+            if (isIdentityBead(id)) {
+              return errorResult(
+                `Bead '${id}' is an agent identity bead. Use bd_identity to manage your own identity bead.`,
+              );
+            }
+          }
+
+          switch (command) {
+            case "show":
+              if (!id) return errorResult("'id' parameter required.");
+              return textResult(bd(`show ${id}`));
+
+            case "list":
+              return textResult(bd("list --limit 20"));
+
+            case "ready":
+              return textResult(bd("ready"));
+
+            case "query":
+              if (!text) return errorResult("'text' parameter required for query.");
+              return textResult(bd(`query "${text.replace(/"/g, '\\"')}"`));
+
+            case "comment":
+              if (!id) return errorResult("'id' parameter required.");
+              if (!text) return errorResult("'text' parameter required.");
+              bd(`comments add ${id} "${text.replace(/"/g, '\\"')}"`);
+              return textResult(`Comment added to ${id}`);
+
+            case "edit":
+              if (!id) return errorResult("'id' parameter required.");
+              if (!text) return errorResult("'text' parameter required.");
+              bd(`update ${id} --description "${text.replace(/"/g, '\\"')}"`);
+              return textResult(`Description updated on ${id}`);
+
+            case "create":
+              if (!text) return errorResult("'text' parameter required (bead title).");
+              const newId = bd(`q "${text.replace(/"/g, '\\"')}"`);
+              return textResult(`Created bead: ${newId}`);
+
+            case "close":
+              if (!id) return errorResult("'id' parameter required.");
+              if (isIdentityBead(id)) {
+                return errorResult("Cannot close an identity bead.");
+              }
+              bd(`close ${id}`);
+              return textResult(`Closed ${id}`);
+
+            case "label":
+              if (!id) return errorResult("'id' parameter required.");
+              if (!text) return errorResult("'text' parameter required (label name).");
+              if (text.trim() === IDENTITY_LABEL) {
+                return errorResult(
+                  `Cannot add '${IDENTITY_LABEL}' label. Identity beads are managed by the platform.`,
+                );
+              }
+              bd(`label add ${id} "${text.replace(/"/g, '\\"')}"`);
+              return textResult(`Label '${text}' added to ${id}`);
+
+            case "sync":
+              return textResult(bd("sync"));
+
+            default:
+              return errorResult(`Unknown command: ${command}`);
+          }
+        },
+      };
+    },
+  );
+}
+
+// ─── Plugin entry point ───────────────────────────────────────────
+
+export default function register(api: any) {
+  registerIdentityTool(api);
+  registerProjectTool(api);
+  api.logger.info("bd-identity: registered bd_identity + bd_project tools");
 }
