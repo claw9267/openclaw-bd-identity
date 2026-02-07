@@ -1,0 +1,12 @@
+{
+  "id": "bd-identity",
+  "name": "Bead Identity",
+  "version": "1.0.0",
+  "description": "Session-aware agent identity bead management. Uses gateway-injected session context for tamper-proof identity resolution.",
+  "entry": "index.ts",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
