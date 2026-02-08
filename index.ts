@@ -3,17 +3,28 @@
  *
  * Provides two tools:
  *
- * bd_identity — Manage your own identity bead (personality, context, focus).
- *   Gateway injects sessionKey/agentId. Agent cannot access other agents' beads.
- *   Commands: whoami, show, comment, edit, comments, prune, init
+ * bd_identity — Manage your own identity bead (personality, context, focus)
+ *   AND per-session memory (history + curated memory).
+ *   Gateway injects sessionKey/agentId. Agent cannot access other agents' beads or memory.
+ *   Commands: whoami, show, comment, edit, comments, init,
+ *             memory_read, memory_write, history_read, history_append
  *
  * bd_project — Full bead access EXCEPT identity beads.
  *   For agents that need to manage project/task beads but must not tamper
  *   with any agent's identity. Checks the "agent-identity" label before writes.
- *   Commands: show, list, comment, edit, create, close, ready, query
+ *   Commands: show, list, comment, edit, create, close, ready, query, label, sync
  */
 
 import { execSync } from "child_process";
+import {
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+  appendFileSync,
+  existsSync,
+} from "fs";
+import { join } from "path";
+import { homedir } from "os";
 
 const IDENTITY_LABEL = "agent-identity";
 
@@ -46,6 +57,71 @@ function textResult(text: string) {
 
 function errorResult(msg: string) {
   return { content: [{ type: "text" as const, text: `Error: ${msg}` }] };
+}
+
+// ─── Per-session memory ───────────────────────────────────────────
+
+const MEMORY_BASE = join(homedir(), ".openclaw", "memory");
+
+/**
+ * Derive a filesystem-safe directory name from a session key.
+ *
+ * Examples:
+ *   agent:main:main                                      → main
+ *   agent:discord:discord:channel:1467935902931222589     → discord-channel-1467935902931222589
+ *   agent:devops:main                                    → devops
+ *   agent:main:cron:evening-briefing                     → main-cron-evening-briefing
+ */
+function sessionKeyToMemoryDir(sessionKey: string): string {
+  const parts = sessionKey.split(":");
+  if (parts.length < 3) return parts.join("-");
+
+  const agentId = parts[1];
+  const rest = parts.slice(2);
+
+  // agent:<id>:main → just the agent ID
+  if (rest.length === 1 && rest[0] === "main") return agentId;
+
+  // Channel sessions: look for a long numeric ID (Discord channel/peer ID)
+  const numericId = rest.find((p) => /^\d{15,}$/.test(p));
+  if (numericId) return `${agentId}-channel-${numericId}`;
+
+  // Cron sessions: agent:<id>:cron:<name>
+  if (rest[0] === "cron") return `${agentId}-cron-${rest.slice(1).join("-")}`;
+
+  // Fallback: agentId + sanitized rest
+  return `${agentId}-${rest.join("-")}`;
+}
+
+function ensureMemoryDir(sessionKey: string): string {
+  const dir = join(MEMORY_BASE, sessionKeyToMemoryDir(sessionKey));
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function readMemoryFile(sessionKey: string, filename: string): string {
+  const dir = ensureMemoryDir(sessionKey);
+  const filepath = join(dir, filename);
+  if (!existsSync(filepath)) return "";
+  return readFileSync(filepath, "utf-8");
+}
+
+function writeMemoryFile(
+  sessionKey: string,
+  filename: string,
+  content: string,
+): void {
+  const dir = ensureMemoryDir(sessionKey);
+  writeFileSync(join(dir, filename), content, "utf-8");
+}
+
+function appendMemoryFile(
+  sessionKey: string,
+  filename: string,
+  content: string,
+): void {
+  const dir = ensureMemoryDir(sessionKey);
+  appendFileSync(join(dir, filename), content + "\n", "utf-8");
 }
 
 // ─── Identity bead discovery ──────────────────────────────────────
@@ -156,18 +232,35 @@ Commands:
 - comments: List all comments on your identity bead
 - init: Find or create your identity bead
 
+Memory (per-session, isolated — only you can access your own):
+- memory_read: Read your curated memory
+- memory_write: Replace your curated memory (full rewrite)
+- history_read: Read your task history log
+- history_append: Append an entry to your task history (append-only)
+
 Keep your bead lean: current focus, active tasks, recent decisions, personality. Move long-term knowledge to memory files.`,
         parameters: {
           type: "object",
           properties: {
             command: {
               type: "string",
-              enum: ["whoami", "show", "comment", "edit", "comments", "init"],
+              enum: [
+                "whoami",
+                "show",
+                "comment",
+                "edit",
+                "comments",
+                "init",
+                "memory_read",
+                "memory_write",
+                "history_read",
+                "history_append",
+              ],
               description: "The identity command to run",
             },
             text: {
               type: "string",
-              description: "Text for comment or edit commands",
+              description: "Text for comment, edit, memory_write, or history_append commands",
             },
           },
           required: ["command"],
@@ -230,6 +323,38 @@ Keep your bead lean: current focus, active tasks, recent decisions, personality.
               const newId = createIdentityBead(createLabel);
               if (!newId) return errorResult("Failed to create identity bead.");
               return textResult(`Created identity bead: ${newId} (label: ${createLabel})`);
+            }
+
+            // ─── Per-session memory commands ─────────────────────
+
+            case "memory_read": {
+              const content = readMemoryFile(sessionKey, "memory.md");
+              const dir = sessionKeyToMemoryDir(sessionKey);
+              return textResult(
+                content || `(empty — no memory yet)\nMemory dir: ${dir}`,
+              );
+            }
+
+            case "memory_write": {
+              if (!text) return errorResult("'text' parameter required for memory_write.");
+              writeMemoryFile(sessionKey, "memory.md", text);
+              const dir = sessionKeyToMemoryDir(sessionKey);
+              return textResult(`Memory updated. (${dir}/memory.md)`);
+            }
+
+            case "history_read": {
+              const content = readMemoryFile(sessionKey, "history.md");
+              const dir = sessionKeyToMemoryDir(sessionKey);
+              return textResult(
+                content || `(empty — no history yet)\nHistory dir: ${dir}`,
+              );
+            }
+
+            case "history_append": {
+              if (!text) return errorResult("'text' parameter required for history_append.");
+              appendMemoryFile(sessionKey, "history.md", text);
+              const dir = sessionKeyToMemoryDir(sessionKey);
+              return textResult(`History appended. (${dir}/history.md)`);
             }
 
             default:
