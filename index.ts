@@ -221,8 +221,8 @@ function registerIdentityTool(api: any) {
       const labels = sessionKey ? sessionKeyToLabels(sessionKey, agentId) : [];
 
       return {
-        name: "bd_identity",
-        description: `Manage your agent identity bead. Your identity is automatically resolved from your session — you cannot access other agents' beads.
+        name: "agent_self",
+        description: `Manage your agent identity bead and per-session memory. Your identity is automatically resolved from your session — you cannot access other agents' beads or memory.
 
 Commands:
 - whoami: Show your session key, agent ID, and identity bead
