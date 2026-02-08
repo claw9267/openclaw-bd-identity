@@ -1,13 +1,13 @@
 /**
- * bd-identity plugin: Session-aware agent identity + project bead management.
+ * bd-identity plugin: Session-aware agent identity + project bead management + workspace memory.
  *
  * Provides two tools:
  *
- * bd_identity — Manage your own identity bead (personality, context, focus)
- *   AND per-session memory (history + curated memory).
+ * agent_self — Manage your own identity bead (personality, context, focus)
+ *   AND workspace memory (per-agent daily files).
  *   Gateway injects sessionKey/agentId. Agent cannot access other agents' beads or memory.
  *   Commands: whoami, show, comment, edit, comments, init,
- *             memory_read, memory_write, history_read, history_append
+ *             memory_write, memory_load, memory_read, memory_search
  *
  * bd_project — Full bead access EXCEPT identity beads.
  *   For agents that need to manage project/task beads but must not tamper
@@ -22,9 +22,12 @@ import {
   writeFileSync,
   appendFileSync,
   existsSync,
+  readdirSync,
+  statSync,
 } from "fs";
-import { join } from "path";
+import { join, relative } from "path";
 import { homedir } from "os";
+// MeiliSearch queried via curl (simpler than http module in plugin context)
 
 const IDENTITY_LABEL = "agent-identity";
 
@@ -59,69 +62,225 @@ function errorResult(msg: string) {
   return { content: [{ type: "text" as const, text: `Error: ${msg}` }] };
 }
 
-// ─── Per-session memory ───────────────────────────────────────────
+// ─── Workspace memory ─────────────────────────────────────────────
 
-const MEMORY_BASE = join(homedir(), ".openclaw", "memory");
+// Workspace root — where memory/ lives
+const WORKSPACE = join(homedir(), ".openclaw", "workspace");
+const MEMORY_ROOT = join(WORKSPACE, "memory");
 
 /**
- * Derive a filesystem-safe directory name from a session key.
- *
- * Examples:
- *   agent:main:main                                      → main
- *   agent:discord:discord:channel:1467935902931222589     → discord-channel-1467935902931222589
- *   agent:devops:main                                    → devops
- *   agent:main:cron:evening-briefing                     → main-cron-evening-briefing
+ * Get the memory directory for an agent.
+ * Structure: workspace/memory/<agentId>/<year>/YYYY-MM-DD.md
  */
-function sessionKeyToMemoryDir(sessionKey: string): string {
-  const parts = sessionKey.split(":");
-  if (parts.length < 3) return parts.join("-");
-
-  const agentId = parts[1];
-  const rest = parts.slice(2);
-
-  // agent:<id>:main → just the agent ID
-  if (rest.length === 1 && rest[0] === "main") return agentId;
-
-  // Channel sessions: look for a long numeric ID (Discord channel/peer ID)
-  const numericId = rest.find((p) => /^\d{15,}$/.test(p));
-  if (numericId) return `${agentId}-channel-${numericId}`;
-
-  // Cron sessions: agent:<id>:cron:<name>
-  if (rest[0] === "cron") return `${agentId}-cron-${rest.slice(1).join("-")}`;
-
-  // Fallback: agentId + sanitized rest
-  return `${agentId}-${rest.join("-")}`;
-}
-
-function ensureMemoryDir(sessionKey: string): string {
-  const dir = join(MEMORY_BASE, sessionKeyToMemoryDir(sessionKey));
+function agentMemoryDir(agentId: string): string {
+  const dir = join(MEMORY_ROOT, agentId);
   mkdirSync(dir, { recursive: true });
   return dir;
 }
 
-function readMemoryFile(sessionKey: string, filename: string): string {
-  const dir = ensureMemoryDir(sessionKey);
-  const filepath = join(dir, filename);
+function todayStr(): string {
+  // Format: YYYY-MM-DD in local time
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  const d = String(now.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+function yesterdayStr(): string {
+  const now = new Date();
+  now.setDate(now.getDate() - 1);
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  const d = String(now.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+function yearFromDate(dateStr: string): string {
+  return dateStr.substring(0, 4);
+}
+
+function dailyFilePath(agentId: string, dateStr: string): string {
+  const year = yearFromDate(dateStr);
+  const dir = join(agentMemoryDir(agentId), year);
+  mkdirSync(dir, { recursive: true });
+  return join(dir, `${dateStr}.md`);
+}
+
+function readDailyFile(agentId: string, dateStr: string): string {
+  const filepath = dailyFilePath(agentId, dateStr);
   if (!existsSync(filepath)) return "";
   return readFileSync(filepath, "utf-8");
 }
 
-function writeMemoryFile(
-  sessionKey: string,
-  filename: string,
-  content: string,
-): void {
-  const dir = ensureMemoryDir(sessionKey);
-  writeFileSync(join(dir, filename), content, "utf-8");
+function appendToDaily(agentId: string, text: string): string {
+  const date = todayStr();
+  const filepath = dailyFilePath(agentId, date);
+
+  if (!existsSync(filepath)) {
+    // Create with header
+    const dayName = new Date().toLocaleDateString("en-US", { weekday: "long" });
+    writeFileSync(filepath, `# ${date} (${dayName})\n\n${text}\n`, "utf-8");
+  } else {
+    appendFileSync(filepath, `\n${text}\n`, "utf-8");
+  }
+
+  return filepath;
 }
 
-function appendMemoryFile(
-  sessionKey: string,
-  filename: string,
-  content: string,
-): void {
-  const dir = ensureMemoryDir(sessionKey);
-  appendFileSync(join(dir, filename), content + "\n", "utf-8");
+// ─── MeiliSearch integration ──────────────────────────────────────
+
+const MEILI_URL = process.env.MEILI_URL || "http://localhost:7700";
+
+/**
+ * Query MeiliSearch and return formatted results.
+ * Falls back to grep-based search if MeiliSearch is unavailable.
+ */
+function searchMeili(
+  indexName: string,
+  query: string,
+  limit = 10,
+): string {
+  try {
+    const body = JSON.stringify({
+      q: query,
+      limit,
+      attributesToRetrieve: ["agentId", "date", "path", "filename"],
+      attributesToCrop: ["content"],
+      cropLength: 200,
+      showMatchesPosition: false,
+    });
+
+    // Use curl for reliable HTTP from plugin context
+    // Write body to stdin to avoid shell escaping issues
+    const result = execSync(
+      `curl -sf "${MEILI_URL}/indexes/${indexName}/search" -H 'Content-Type: application/json' --data-binary @-`,
+      { encoding: "utf-8", timeout: 5000, input: body },
+    ).trim();
+
+    const parsed = JSON.parse(result);
+
+    if (!parsed.hits || parsed.hits.length === 0) {
+      return `No results for "${query}" in ${indexName}.`;
+    }
+
+    const lines: string[] = [
+      `Found ${parsed.hits.length} result(s) for "${query}" (${parsed.processingTimeMs}ms):`,
+      "",
+    ];
+
+    for (const hit of parsed.hits) {
+      const cropped =
+        hit._formatted?.content || "(no preview)";
+      lines.push(`--- ${hit.path} (${hit.date || hit.filename}) ---`);
+      lines.push(cropped);
+      lines.push("");
+    }
+
+    return lines.join("\n");
+  } catch (e: any) {
+    // MeiliSearch unavailable — fall back to grep
+    return searchMemoryGrep(indexName.replace("memory-", ""), query);
+  }
+}
+
+/**
+ * Recursively collect all .md files under a directory.
+ */
+function collectMarkdownFiles(dir: string): string[] {
+  const results: string[] = [];
+  if (!existsSync(dir)) return results;
+
+  const entries = readdirSync(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const fullPath = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      results.push(...collectMarkdownFiles(fullPath));
+    } else if (entry.name.endsWith(".md")) {
+      results.push(fullPath);
+    }
+  }
+  return results;
+}
+
+/**
+ * Fallback grep-based search when MeiliSearch is unavailable.
+ */
+function searchMemoryGrep(
+  agentId: string,
+  query: string,
+  maxResults = 20,
+): string {
+  const dir = agentId === "all"
+    ? MEMORY_ROOT
+    : agentMemoryDir(agentId);
+  const files = collectMarkdownFiles(dir);
+  const queryLower = query.toLowerCase();
+  const matches: string[] = [];
+
+  for (const filepath of files) {
+    const content = readFileSync(filepath, "utf-8");
+    const lines = content.split("\n");
+    const relPath = relative(MEMORY_ROOT, filepath);
+
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].toLowerCase().includes(queryLower)) {
+        const start = Math.max(0, i - 1);
+        const end = Math.min(lines.length - 1, i + 2);
+        const snippet = lines.slice(start, end + 1).join("\n");
+        matches.push(`--- ${relPath}:${i + 1} ---\n${snippet}`);
+
+        if (matches.length >= maxResults) break;
+      }
+    }
+    if (matches.length >= maxResults) break;
+  }
+
+  if (matches.length === 0) {
+    return `No results for "${query}" in ${agentId}'s memory. (grep fallback)`;
+  }
+
+  return `Found ${matches.length} match(es) for "${query}" (grep fallback):\n\n${matches.join("\n\n")}`;
+}
+
+/**
+ * Index a single daily file into MeiliSearch (both agent index and memory-all).
+ * Called after memory_write — only updates the one document that changed.
+ */
+function indexSingleDocument(agentId: string, dateStr: string): void {
+  try {
+    const filepath = dailyFilePath(agentId, dateStr);
+    if (!existsSync(filepath)) return;
+
+    const content = readFileSync(filepath, "utf-8").trim();
+    if (!content) return;
+
+    const relPath = relative(MEMORY_ROOT, filepath);
+    const docId = `${agentId}_${dateStr}`.replace(/[/.]/g, "_");
+
+    const doc = JSON.stringify([{
+      id: docId,
+      agentId,
+      date: dateStr,
+      path: relPath,
+      filename: dateStr,
+      content,
+    }]);
+
+    // Update agent-specific index
+    execSync(
+      `curl -sf -X POST "${MEILI_URL}/indexes/memory-${agentId}/documents" -H 'Content-Type: application/json' --data-binary @-`,
+      { encoding: "utf-8", timeout: 5000, input: doc, stdio: ["pipe", "pipe", "pipe"] },
+    );
+
+    // Update combined index
+    execSync(
+      `curl -sf -X POST "${MEILI_URL}/indexes/memory-all/documents" -H 'Content-Type: application/json' --data-binary @-`,
+      { encoding: "utf-8", timeout: 5000, input: doc, stdio: ["pipe", "pipe", "pipe"] },
+    );
+  } catch {
+    // Best effort — don't block on indexing failures
+  }
 }
 
 // ─── Identity bead discovery ──────────────────────────────────────
@@ -207,7 +366,7 @@ function createIdentityBead(label: string): string | null {
   }
 }
 
-// ─── bd_identity tool ─────────────────────────────────────────────
+// ─── agent_self tool ──────────────────────────────────────────────
 
 function registerIdentityTool(api: any) {
   api.registerTool(
@@ -217,12 +376,12 @@ function registerIdentityTool(api: any) {
       sandboxed?: boolean;
     }) => {
       const sessionKey = ctx.sessionKey;
-      const agentId = ctx.agentId;
+      const agentId = ctx.agentId || "main";
       const labels = sessionKey ? sessionKeyToLabels(sessionKey, agentId) : [];
 
       return {
         name: "agent_self",
-        description: `Manage your agent identity bead and per-session memory. Your identity is automatically resolved from your session — you cannot access other agents' beads or memory.
+        description: `Manage your agent identity bead and per-agent workspace memory. Your identity is automatically resolved from your session — you cannot access other agents' beads or memory.
 
 Commands:
 - whoami: Show your session key, agent ID, and identity bead
@@ -232,13 +391,14 @@ Commands:
 - comments: List all comments on your identity bead
 - init: Find or create your identity bead
 
-Memory (per-session, isolated — only you can access your own):
-- memory_read: Read your curated memory
-- memory_write: Replace your curated memory (full rewrite)
-- history_read: Read your task history log
-- history_append: Append an entry to your task history (append-only)
+Memory (per-agent, workspace-level — persists across sessions for the same agent):
+- memory_write: Append text to today's daily file (memory/<agentId>/<year>/YYYY-MM-DD.md)
+- memory_load: Read MEMORY.md + today's + yesterday's daily files
+- memory_read: Read a specific day's daily file (pass date as text, e.g. "2026-02-07")
+- memory_search: Search across all your daily files for a keyword/topic
+- memory_search_all: Search across ALL agents' memory files (find if anyone else encountered something)
 
-Keep your bead lean: current focus, active tasks, recent decisions, personality. Move long-term knowledge to memory files.`,
+Keep your bead lean: current focus, active tasks, recent decisions, personality. Move long-term knowledge to daily memory files.`,
         parameters: {
           type: "object",
           properties: {
@@ -251,22 +411,27 @@ Keep your bead lean: current focus, active tasks, recent decisions, personality.
                 "edit",
                 "comments",
                 "init",
-                "memory_read",
                 "memory_write",
-                "history_read",
-                "history_append",
+                "memory_load",
+                "memory_read",
+                "memory_search",
+                "memory_search_all",
               ],
               description: "The identity command to run",
             },
             text: {
               type: "string",
-              description: "Text for comment, edit, memory_write, or history_append commands",
+              description:
+                "Text for comment, edit, memory_write commands. Date string (YYYY-MM-DD) for memory_read. Query string for memory_search.",
             },
           },
           required: ["command"],
         },
 
-        async execute(_id: string, params: { command: string; text?: string }) {
+        async execute(
+          _id: string,
+          params: { command: string; text?: string },
+        ) {
           const { command, text } = params;
 
           if (!sessionKey) {
@@ -276,35 +441,56 @@ Keep your bead lean: current focus, active tasks, recent decisions, personality.
           const beadId = findIdentityBead(labels);
 
           switch (command) {
+            // ─── Identity bead commands ────────────────────────
+
             case "whoami":
               return textResult(
                 [
                   `Session Key: ${sessionKey}`,
-                  `Agent ID:    ${agentId ?? "unknown"}`,
+                  `Agent ID:    ${agentId}`,
                   `Bead ID:     ${beadId ?? "<not found — run init>"}`,
                   `Labels:      ${labels.join(", ")}`,
                   `Sandboxed:   ${ctx.sandboxed ?? "unknown"}`,
+                  `Memory Dir:  memory/${agentId}/`,
                 ].join("\n"),
               );
 
             case "show":
-              if (!beadId) return errorResult(`No identity bead found. Run 'init' first.`);
+              if (!beadId)
+                return errorResult(
+                  `No identity bead found. Run 'init' first.`,
+                );
               return textResult(bd(`show ${beadId}`));
 
             case "comment":
-              if (!text) return errorResult("'text' parameter required for comment.");
-              if (!beadId) return errorResult("No identity bead found. Run 'init' first.");
-              bd(`comments add ${beadId} "${text.replace(/"/g, '\\"')}"`);
+              if (!text)
+                return errorResult("'text' parameter required for comment.");
+              if (!beadId)
+                return errorResult(
+                  "No identity bead found. Run 'init' first.",
+                );
+              bd(
+                `comments add ${beadId} "${text.replace(/"/g, '\\"')}"`,
+              );
               return textResult(`Comment added to ${beadId}`);
 
             case "edit":
-              if (!text) return errorResult("'text' parameter required for edit.");
-              if (!beadId) return errorResult("No identity bead found. Run 'init' first.");
-              bd(`update ${beadId} --description "${text.replace(/"/g, '\\"')}"`);
+              if (!text)
+                return errorResult("'text' parameter required for edit.");
+              if (!beadId)
+                return errorResult(
+                  "No identity bead found. Run 'init' first.",
+                );
+              bd(
+                `update ${beadId} --description "${text.replace(/"/g, '\\"')}"`,
+              );
               return textResult(`Description updated on ${beadId}`);
 
             case "comments": {
-              if (!beadId) return errorResult("No identity bead found. Run 'init' first.");
+              if (!beadId)
+                return errorResult(
+                  "No identity bead found. Run 'init' first.",
+                );
               try {
                 const output = bd(`comments ${beadId}`);
                 return textResult(output || "No comments.");
@@ -314,47 +500,116 @@ Keep your bead lean: current focus, active tasks, recent decisions, personality.
             }
 
             case "init": {
-              if (beadId) return textResult(`Identity bead already exists: ${beadId}`);
+              if (beadId)
+                return textResult(
+                  `Identity bead already exists: ${beadId}`,
+                );
               const createLabel =
                 labels.find((l) => l.startsWith("discord-")) ||
                 labels.find((l) => !l.match(/^\d+$/)) ||
                 agentId ||
                 "unknown";
               const newId = createIdentityBead(createLabel);
-              if (!newId) return errorResult("Failed to create identity bead.");
-              return textResult(`Created identity bead: ${newId} (label: ${createLabel})`);
-            }
-
-            // ─── Per-session memory commands ─────────────────────
-
-            case "memory_read": {
-              const content = readMemoryFile(sessionKey, "memory.md");
-              const dir = sessionKeyToMemoryDir(sessionKey);
+              if (!newId)
+                return errorResult("Failed to create identity bead.");
               return textResult(
-                content || `(empty — no memory yet)\nMemory dir: ${dir}`,
+                `Created identity bead: ${newId} (label: ${createLabel})`,
               );
             }
+
+            // ─── Workspace memory commands ────────────────────
 
             case "memory_write": {
-              if (!text) return errorResult("'text' parameter required for memory_write.");
-              writeMemoryFile(sessionKey, "memory.md", text);
-              const dir = sessionKeyToMemoryDir(sessionKey);
-              return textResult(`Memory updated. (${dir}/memory.md)`);
+              if (!text)
+                return errorResult(
+                  "'text' parameter required for memory_write.",
+                );
+              const filepath = appendToDaily(agentId, text);
+              const relPath = relative(WORKSPACE, filepath);
+              // Index just this document into MeiliSearch
+              indexSingleDocument(agentId, todayStr());
+              return textResult(`Appended to ${relPath}`);
             }
 
-            case "history_read": {
-              const content = readMemoryFile(sessionKey, "history.md");
-              const dir = sessionKeyToMemoryDir(sessionKey);
-              return textResult(
-                content || `(empty — no history yet)\nHistory dir: ${dir}`,
+            case "memory_load": {
+              const parts: string[] = [];
+
+              // 1. MEMORY.md (long-term curated memory)
+              const memoryMdPath = join(WORKSPACE, "MEMORY.md");
+              if (existsSync(memoryMdPath)) {
+                const content = readFileSync(memoryMdPath, "utf-8");
+                parts.push(
+                  `=== MEMORY.md (long-term) ===\n${content}`,
+                );
+              } else {
+                parts.push("=== MEMORY.md === (not found)");
+              }
+
+              // 2. Yesterday's daily file
+              const yesterday = yesterdayStr();
+              const yesterdayContent = readDailyFile(agentId, yesterday);
+              if (yesterdayContent) {
+                parts.push(
+                  `=== ${yesterday} (yesterday) ===\n${yesterdayContent}`,
+                );
+              }
+
+              // 3. Today's daily file
+              const today = todayStr();
+              const todayContent = readDailyFile(agentId, today);
+              if (todayContent) {
+                parts.push(
+                  `=== ${today} (today) ===\n${todayContent}`,
+                );
+              } else {
+                parts.push(
+                  `=== ${today} (today) === (no entries yet)`,
+                );
+              }
+
+              return textResult(parts.join("\n\n"));
+            }
+
+            case "memory_read": {
+              if (!text)
+                return errorResult(
+                  "'text' parameter required for memory_read (date as YYYY-MM-DD).",
+                );
+              // Validate date format
+              const dateMatch = text.trim().match(/^\d{4}-\d{2}-\d{2}$/);
+              if (!dateMatch) {
+                return errorResult(
+                  `Invalid date format: "${text}". Use YYYY-MM-DD.`,
+                );
+              }
+              const content = readDailyFile(agentId, text.trim());
+              if (!content) {
+                return textResult(
+                  `No memory file for ${text.trim()} (${agentId}).`,
+                );
+              }
+              return textResult(content);
+            }
+
+            case "memory_search": {
+              if (!text)
+                return errorResult(
+                  "'text' parameter required for memory_search (search query).",
+                );
+              const searchResult = searchMeili(
+                `memory-${agentId}`,
+                text.trim(),
               );
+              return textResult(searchResult);
             }
 
-            case "history_append": {
-              if (!text) return errorResult("'text' parameter required for history_append.");
-              appendMemoryFile(sessionKey, "history.md", text);
-              const dir = sessionKeyToMemoryDir(sessionKey);
-              return textResult(`History appended. (${dir}/history.md)`);
+            case "memory_search_all": {
+              if (!text)
+                return errorResult(
+                  "'text' parameter required for memory_search_all (search query).",
+                );
+              const allResult = searchMeili("memory-all", text.trim());
+              return textResult(allResult);
             }
 
             default:
@@ -370,10 +625,7 @@ Keep your bead lean: current focus, active tasks, recent decisions, personality.
 
 function registerProjectTool(api: any) {
   api.registerTool(
-    (ctx: {
-      sessionKey?: string;
-      agentId?: string;
-    }) => {
+    (ctx: { sessionKey?: string; agentId?: string }) => {
       return {
         name: "bd_project",
         description: `Manage project and task beads. Full bead access EXCEPT agent identity beads — writes to identity beads are blocked.
@@ -396,22 +648,38 @@ Use this for project work, task tracking, and collaboration. Identity beads are 
           properties: {
             command: {
               type: "string",
-              enum: ["show", "list", "ready", "query", "comment", "edit", "create", "close", "label", "sync"],
+              enum: [
+                "show",
+                "list",
+                "ready",
+                "query",
+                "comment",
+                "edit",
+                "create",
+                "close",
+                "label",
+                "sync",
+              ],
               description: "The project command to run",
             },
             id: {
               type: "string",
-              description: "Bead ID (for show, comment, edit, close, label)",
+              description:
+                "Bead ID (for show, comment, edit, close, label)",
             },
             text: {
               type: "string",
-              description: "Text content (for comment, edit, create, query, label)",
+              description:
+                "Text content (for comment, edit, create, query, label)",
             },
           },
           required: ["command"],
         },
 
-        async execute(_toolCallId: string, params: { command: string; id?: string; text?: string }) {
+        async execute(
+          _toolCallId: string,
+          params: { command: string; id?: string; text?: string },
+        ) {
           const { command, id, text } = params;
 
           // Write commands that target a specific bead — check identity protection
@@ -436,24 +704,40 @@ Use this for project work, task tracking, and collaboration. Identity beads are 
               return textResult(bd("ready"));
 
             case "query":
-              if (!text) return errorResult("'text' parameter required for query.");
-              return textResult(bd(`query "${text.replace(/"/g, '\\"')}"`));
+              if (!text)
+                return errorResult(
+                  "'text' parameter required for query.",
+                );
+              return textResult(
+                bd(`query "${text.replace(/"/g, '\\"')}"`),
+              );
 
             case "comment":
               if (!id) return errorResult("'id' parameter required.");
-              if (!text) return errorResult("'text' parameter required.");
-              bd(`comments add ${id} "${text.replace(/"/g, '\\"')}"`);
+              if (!text)
+                return errorResult("'text' parameter required.");
+              bd(
+                `comments add ${id} "${text.replace(/"/g, '\\"')}"`,
+              );
               return textResult(`Comment added to ${id}`);
 
             case "edit":
               if (!id) return errorResult("'id' parameter required.");
-              if (!text) return errorResult("'text' parameter required.");
-              bd(`update ${id} --description "${text.replace(/"/g, '\\"')}"`);
+              if (!text)
+                return errorResult("'text' parameter required.");
+              bd(
+                `update ${id} --description "${text.replace(/"/g, '\\"')}"`,
+              );
               return textResult(`Description updated on ${id}`);
 
             case "create":
-              if (!text) return errorResult("'text' parameter required (bead title).");
-              const newId = bd(`q "${text.replace(/"/g, '\\"')}"`);
+              if (!text)
+                return errorResult(
+                  "'text' parameter required (bead title).",
+                );
+              const newId = bd(
+                `q "${text.replace(/"/g, '\\"')}"`,
+              );
               return textResult(`Created bead: ${newId}`);
 
             case "close":
@@ -466,13 +750,18 @@ Use this for project work, task tracking, and collaboration. Identity beads are 
 
             case "label":
               if (!id) return errorResult("'id' parameter required.");
-              if (!text) return errorResult("'text' parameter required (label name).");
+              if (!text)
+                return errorResult(
+                  "'text' parameter required (label name).",
+                );
               if (text.trim() === IDENTITY_LABEL) {
                 return errorResult(
                   `Cannot add '${IDENTITY_LABEL}' label. Identity beads are managed by the platform.`,
                 );
               }
-              bd(`label add ${id} "${text.replace(/"/g, '\\"')}"`);
+              bd(
+                `label add ${id} "${text.replace(/"/g, '\\"')}"`,
+              );
               return textResult(`Label '${text}' added to ${id}`);
 
             case "sync":
@@ -492,5 +781,5 @@ Use this for project work, task tracking, and collaboration. Identity beads are 
 export default function register(api: any) {
   registerIdentityTool(api);
   registerProjectTool(api);
-  api.logger.info("bd-identity: registered bd_identity + bd_project tools");
+  api.logger.info("bd-identity: registered agent_self + bd_project tools");
 }

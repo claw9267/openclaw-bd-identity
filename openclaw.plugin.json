@@ -1,8 +1,8 @@
 {
   "id": "bd-identity",
   "name": "Bead Identity & Project Management",
-  "version": "2.0.0",
-  "description": "Session-aware identity bead management (bd_identity) + identity-protected project bead access (bd_project). Uses gateway-injected session context for tamper-proof identity resolution.",
+  "version": "3.0.0",
+  "description": "Session-aware identity bead management (agent_self) with per-agent workspace memory + identity-protected project bead access (bd_project). Uses gateway-injected session context for tamper-proof identity resolution.",
   "entry": "index.ts",
   "configSchema": {
     "type": "object",
