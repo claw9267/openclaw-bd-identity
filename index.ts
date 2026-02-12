@@ -4,10 +4,11 @@
  * Provides two tools:
  *
  * agent_self — Manage your own identity bead (personality, context, focus)
- *   AND workspace memory (per-agent daily files).
+ *   AND workspace memory (per-agent daily files + SOUL.md + MEMORY.md).
  *   Gateway injects sessionKey/agentId. Agent cannot access other agents' beads or memory.
  *   Commands: whoami, show, comment, edit, comments, init,
- *             memory_write, memory_load, memory_read, memory_search
+ *             soul_read, soul_write, ltm_read, ltm_write,
+ *             memory_write, memory_load, memory_read, memory_search, memory_search_all
  *
  * bd_project — Full bead access EXCEPT identity beads.
  *   For agents that need to manage project/task beads but must not tamper
@@ -15,7 +16,7 @@
  *   Commands: show, list, comment, edit, create, close, ready, query, label, sync
  */
 
-import { execSync } from "child_process";
+import { execSync, spawnSync } from "child_process";
 import {
   mkdirSync,
   readFileSync,
@@ -33,21 +34,21 @@ const IDENTITY_LABEL = "agent-identity";
 
 // ─── Shared helpers ───────────────────────────────────────────────
 
-function bd(args: string, timeoutMs = 10000): string {
-  try {
-    return execSync(`bd ${args}`, {
-      encoding: "utf-8",
-      timeout: timeoutMs,
-    }).trim();
-  } catch (e: any) {
-    const msg = e.stderr?.trim() || e.message;
+function bd(args: string[], timeoutMs = 10000): string {
+  const result = spawnSync("bd", args, {
+    encoding: "utf-8",
+    timeout: timeoutMs,
+  });
+  if (result.status !== 0) {
+    const msg = result.stderr?.trim() || result.error?.message || "unknown error";
     throw new Error(`bd failed: ${msg}`);
   }
+  return (result.stdout || "").trim();
 }
 
 function isIdentityBead(beadId: string): boolean {
   try {
-    const result = bd(`label list ${beadId}`);
+    const result = bd(["label", "list", beadId]);
     return result.includes(IDENTITY_LABEL);
   } catch {
     return false;
@@ -78,22 +79,21 @@ function agentMemoryDir(agentId: string): string {
   return dir;
 }
 
-function todayStr(): string {
-  // Format: YYYY-MM-DD in local time
+function dateInTz(offset = 0): string {
+  const tz = process.env.TZ || process.env.OPENCLAW_TZ || "America/Chicago";
   const now = new Date();
-  const y = now.getFullYear();
-  const m = String(now.getMonth() + 1).padStart(2, "0");
-  const d = String(now.getDate()).padStart(2, "0");
-  return `${y}-${m}-${d}`;
+  if (offset !== 0) {
+    now.setDate(now.getDate() + offset);
+  }
+  return now.toLocaleDateString("en-CA", { timeZone: tz }); // en-CA gives YYYY-MM-DD
+}
+
+function todayStr(): string {
+  return dateInTz(0);
 }
 
 function yesterdayStr(): string {
-  const now = new Date();
-  now.setDate(now.getDate() - 1);
-  const y = now.getFullYear();
-  const m = String(now.getMonth() + 1).padStart(2, "0");
-  const d = String(now.getDate()).padStart(2, "0");
-  return `${y}-${m}-${d}`;
+  return dateInTz(-1);
 }
 
 function yearFromDate(dateStr: string): string {
@@ -119,7 +119,11 @@ function appendToDaily(agentId: string, text: string): string {
 
   if (!existsSync(filepath)) {
     // Create with header
-    const dayName = new Date().toLocaleDateString("en-US", { weekday: "long" });
+    const tz = process.env.TZ || process.env.OPENCLAW_TZ || "America/Chicago";
+    const dayName = new Date().toLocaleDateString("en-US", { 
+      weekday: "long",
+      timeZone: tz 
+    });
     writeFileSync(filepath, `# ${date} (${dayName})\n\n${text}\n`, "utf-8");
   } else {
     appendFileSync(filepath, `\n${text}\n`, "utf-8");
@@ -315,9 +319,11 @@ function findIdentityBead(searchLabels: string[]): string | null {
   // Try direct label match first
   for (const label of searchLabels) {
     try {
-      const result = bd(
-        `query "label=${IDENTITY_LABEL} AND label=${label}" --json`,
-      );
+      const result = bd([
+        "query", 
+        `label=${IDENTITY_LABEL} AND label=${label}`, 
+        "--json"
+      ]);
       const beads = JSON.parse(result);
       if (Array.isArray(beads) && beads.length > 0 && beads[0].id) {
         return beads[0].id;
@@ -331,7 +337,7 @@ function findIdentityBead(searchLabels: string[]): string | null {
   for (const label of searchLabels) {
     if (/^\d{15,}$/.test(label)) {
       try {
-        const result = bd(`query "label=${IDENTITY_LABEL}" --json`);
+        const result = bd(["query", `label=${IDENTITY_LABEL}`, "--json"]);
         const beads = JSON.parse(result);
         if (Array.isArray(beads)) {
           const match = beads.find(
@@ -352,13 +358,19 @@ function findIdentityBead(searchLabels: string[]): string | null {
 
 function createIdentityBead(label: string): string | null {
   try {
-    const id = bd(
-      `q "Agent Identity: ${label}" --labels "${IDENTITY_LABEL},${label},session-context"`,
-    );
+    const id = bd([
+      "q", 
+      `Agent Identity: ${label}`, 
+      "--labels", 
+      `${IDENTITY_LABEL},${label},session-context`
+    ]);
     if (id) {
-      bd(
-        `update "${id}" --description "Identity bead for '${label}'. Auto-created by bd-identity plugin."`,
-      );
+      bd([
+        "update", 
+        id, 
+        "--description", 
+        `Identity bead for '${label}'. Auto-created by bd-identity plugin.`
+      ]);
     }
     return id || null;
   } catch {
@@ -391,14 +403,20 @@ Commands:
 - comments: List all comments on your identity bead
 - init: Find or create your identity bead
 
-Memory (per-agent, workspace-level — persists across sessions for the same agent):
+Agent-specific personality and long-term memory:
+- soul_read: Read your individual personality file (memory/<agentId>/SOUL.md)
+- soul_write: Write/replace your personality file (memory/<agentId>/SOUL.md)
+- ltm_read: Read your long-term memory (memory/<agentId>/MEMORY.md)
+- ltm_write: Write/replace your long-term memory (memory/<agentId>/MEMORY.md) — used by nightly summarizer
+
+Daily memory (per-agent, workspace-level — persists across sessions for the same agent):
 - memory_write: Append text to today's daily file (memory/<agentId>/<year>/YYYY-MM-DD.md)
-- memory_load: Read MEMORY.md + today's + yesterday's daily files
+- memory_load: Read layered memory: shared MEMORY.md → agent SOUL.md → agent MEMORY.md → yesterday → today
 - memory_read: Read a specific day's daily file (pass date as text, e.g. "2026-02-07")
 - memory_search: Search across all your daily files for a keyword/topic
 - memory_search_all: Search across ALL agents' memory files (find if anyone else encountered something)
 
-Keep your bead lean: current focus, active tasks, recent decisions, personality. Move long-term knowledge to daily memory files.`,
+Keep your bead lean: current focus, active tasks, recent decisions. Move personality to SOUL.md, long-term lessons to agent MEMORY.md, and detailed logs to daily files.`,
         parameters: {
           type: "object",
           properties: {
@@ -411,6 +429,10 @@ Keep your bead lean: current focus, active tasks, recent decisions, personality.
                 "edit",
                 "comments",
                 "init",
+                "soul_read",
+                "soul_write",
+                "ltm_read",
+                "ltm_write",
                 "memory_write",
                 "memory_load",
                 "memory_read",
@@ -460,7 +482,7 @@ Keep your bead lean: current focus, active tasks, recent decisions, personality.
                 return errorResult(
                   `No identity bead found. Run 'init' first.`,
                 );
-              return textResult(bd(`show ${beadId}`));
+              return textResult(bd(["show", beadId]));
 
             case "comment":
               if (!text)
@@ -469,9 +491,7 @@ Keep your bead lean: current focus, active tasks, recent decisions, personality.
                 return errorResult(
                   "No identity bead found. Run 'init' first.",
                 );
-              bd(
-                `comments add ${beadId} "${text.replace(/"/g, '\\"')}"`,
-              );
+              bd(["comments", "add", beadId, text]);
               return textResult(`Comment added to ${beadId}`);
 
             case "edit":
@@ -481,9 +501,7 @@ Keep your bead lean: current focus, active tasks, recent decisions, personality.
                 return errorResult(
                   "No identity bead found. Run 'init' first.",
                 );
-              bd(
-                `update ${beadId} --description "${text.replace(/"/g, '\\"')}"`,
-              );
+              bd(["update", beadId, "--description", text]);
               return textResult(`Description updated on ${beadId}`);
 
             case "comments": {
@@ -492,7 +510,7 @@ Keep your bead lean: current focus, active tasks, recent decisions, personality.
                   "No identity bead found. Run 'init' first.",
                 );
               try {
-                const output = bd(`comments ${beadId}`);
+                const output = bd(["comments", beadId]);
                 return textResult(output || "No comments.");
               } catch {
                 return textResult("No comments.");
@@ -517,6 +535,44 @@ Keep your bead lean: current focus, active tasks, recent decisions, personality.
               );
             }
 
+            // ─── Agent-specific personality and memory ─────────
+
+            case "soul_read": {
+              const soulPath = join(agentMemoryDir(agentId), "SOUL.md");
+              if (!existsSync(soulPath)) {
+                return textResult(`No SOUL.md file found for agent ${agentId}.`);
+              }
+              const content = readFileSync(soulPath, "utf-8");
+              return textResult(content);
+            }
+
+            case "soul_write": {
+              if (!text)
+                return errorResult("'text' parameter required for soul_write.");
+              const soulPath = join(agentMemoryDir(agentId), "SOUL.md");
+              writeFileSync(soulPath, text, "utf-8");
+              const relPath = relative(WORKSPACE, soulPath);
+              return textResult(`Written to ${relPath}`);
+            }
+
+            case "ltm_read": {
+              const ltmPath = join(agentMemoryDir(agentId), "MEMORY.md");
+              if (!existsSync(ltmPath)) {
+                return textResult(`No MEMORY.md file found for agent ${agentId}.`);
+              }
+              const content = readFileSync(ltmPath, "utf-8");
+              return textResult(content);
+            }
+
+            case "ltm_write": {
+              if (!text)
+                return errorResult("'text' parameter required for ltm_write.");
+              const ltmPath = join(agentMemoryDir(agentId), "MEMORY.md");
+              writeFileSync(ltmPath, text, "utf-8");
+              const relPath = relative(WORKSPACE, ltmPath);
+              return textResult(`Written to ${relPath}`);
+            }
+
             // ─── Workspace memory commands ────────────────────
 
             case "memory_write": {
@@ -534,18 +590,40 @@ Keep your bead lean: current focus, active tasks, recent decisions, personality.
             case "memory_load": {
               const parts: string[] = [];
 
-              // 1. MEMORY.md (long-term curated memory)
+              // 1. Shared MEMORY.md (long-term curated memory)
               const memoryMdPath = join(WORKSPACE, "MEMORY.md");
               if (existsSync(memoryMdPath)) {
                 const content = readFileSync(memoryMdPath, "utf-8");
                 parts.push(
-                  `=== MEMORY.md (long-term) ===\n${content}`,
+                  `=== MEMORY.md (shared long-term) ===\n${content}`,
                 );
               } else {
-                parts.push("=== MEMORY.md === (not found)");
+                parts.push("=== MEMORY.md (shared) === (not found)");
               }
 
-              // 2. Yesterday's daily file
+              // 2. Agent SOUL.md
+              const soulPath = join(agentMemoryDir(agentId), "SOUL.md");
+              if (existsSync(soulPath)) {
+                const content = readFileSync(soulPath, "utf-8");
+                parts.push(
+                  `=== SOUL.md (${agentId} personality) ===\n${content}`,
+                );
+              } else {
+                parts.push(`=== SOUL.md (${agentId}) === (not found)`);
+              }
+
+              // 3. Agent MEMORY.md
+              const ltmPath = join(agentMemoryDir(agentId), "MEMORY.md");
+              if (existsSync(ltmPath)) {
+                const content = readFileSync(ltmPath, "utf-8");
+                parts.push(
+                  `=== MEMORY.md (${agentId} long-term) ===\n${content}`,
+                );
+              } else {
+                parts.push(`=== MEMORY.md (${agentId}) === (not found)`);
+              }
+
+              // 4. Yesterday's daily file
               const yesterday = yesterdayStr();
               const yesterdayContent = readDailyFile(agentId, yesterday);
               if (yesterdayContent) {
@@ -554,7 +632,7 @@ Keep your bead lean: current focus, active tasks, recent decisions, personality.
                 );
               }
 
-              // 3. Today's daily file
+              // 5. Today's daily file
               const today = todayStr();
               const todayContent = readDailyFile(agentId, today);
               if (todayContent) {
@@ -695,39 +773,33 @@ Use this for project work, task tracking, and collaboration. Identity beads are 
           switch (command) {
             case "show":
               if (!id) return errorResult("'id' parameter required.");
-              return textResult(bd(`show ${id}`));
+              return textResult(bd(["show", id]));
 
             case "list":
-              return textResult(bd("list --limit 20"));
+              return textResult(bd(["list", "--limit", "20"]));
 
             case "ready":
-              return textResult(bd("ready"));
+              return textResult(bd(["ready"]));
 
             case "query":
               if (!text)
                 return errorResult(
                   "'text' parameter required for query.",
                 );
-              return textResult(
-                bd(`query "${text.replace(/"/g, '\\"')}"`),
-              );
+              return textResult(bd(["query", text]));
 
             case "comment":
               if (!id) return errorResult("'id' parameter required.");
               if (!text)
                 return errorResult("'text' parameter required.");
-              bd(
-                `comments add ${id} "${text.replace(/"/g, '\\"')}"`,
-              );
+              bd(["comments", "add", id, text]);
               return textResult(`Comment added to ${id}`);
 
             case "edit":
               if (!id) return errorResult("'id' parameter required.");
               if (!text)
                 return errorResult("'text' parameter required.");
-              bd(
-                `update ${id} --description "${text.replace(/"/g, '\\"')}"`,
-              );
+              bd(["update", id, "--description", text]);
               return textResult(`Description updated on ${id}`);
 
             case "create":
@@ -735,9 +807,7 @@ Use this for project work, task tracking, and collaboration. Identity beads are 
                 return errorResult(
                   "'text' parameter required (bead title).",
                 );
-              const newId = bd(
-                `q "${text.replace(/"/g, '\\"')}"`,
-              );
+              const newId = bd(["q", text]);
               return textResult(`Created bead: ${newId}`);
 
             case "close":
@@ -745,7 +815,7 @@ Use this for project work, task tracking, and collaboration. Identity beads are 
               if (isIdentityBead(id)) {
                 return errorResult("Cannot close an identity bead.");
               }
-              bd(`close ${id}`);
+              bd(["close", id]);
               return textResult(`Closed ${id}`);
 
             case "label":
@@ -759,13 +829,11 @@ Use this for project work, task tracking, and collaboration. Identity beads are 
                   `Cannot add '${IDENTITY_LABEL}' label. Identity beads are managed by the platform.`,
                 );
               }
-              bd(
-                `label add ${id} "${text.replace(/"/g, '\\"')}"`,
-              );
+              bd(["label", "add", id, text]);
               return textResult(`Label '${text}' added to ${id}`);
 
             case "sync":
-              return textResult(bd("sync"));
+              return textResult(bd(["sync"]));
 
             default:
               return errorResult(`Unknown command: ${command}`);
