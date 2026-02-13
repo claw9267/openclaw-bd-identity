@@ -1,7 +1,7 @@
 {
   "id": "bd-identity",
   "name": "Bead Identity & Project Management",
-  "version": "4.0.0",
+  "version": "5.0.0",
   "description": "Session-aware identity bead management (agent_self) with workspace memory including per-agent SOUL.md and MEMORY.md + identity-protected project bead access (bd_project). Uses gateway-injected session context for tamper-proof identity resolution.",
   "entry": "index.ts",
   "configSchema": {

@@ -1,7 +1,7 @@
 /**
- * bd-identity plugin: Session-aware agent identity + project bead management + workspace memory.
+ * bd-identity plugin: Session-aware agent identity + project bead management + workspace memory + shared specs.
  *
- * Provides two tools:
+ * Provides three tools:
  *
  * agent_self — Manage your own identity bead (personality, context, focus)
  *   AND workspace memory (per-agent daily files + SOUL.md + MEMORY.md).
@@ -14,6 +14,10 @@
  *   For agents that need to manage project/task beads but must not tamper
  *   with any agent's identity. Checks the "agent-identity" label before writes.
  *   Commands: show, list, comment, edit, create, close, ready, query, label, sync
+ *
+ * specs — Read and write shared spec documents (PRDs, design docs, implementation plans).
+ *   Specs live in workspace/specs/ and are shared across all agents.
+ *   Commands: read, write (write is main agent only)
  */
 
 import { execSync, spawnSync } from "child_process";
@@ -68,6 +72,7 @@ function errorResult(msg: string) {
 // Workspace root — where memory/ lives
 const WORKSPACE = join(homedir(), ".openclaw", "workspace");
 const MEMORY_ROOT = join(WORKSPACE, "memory");
+const SPECS_DIR = join(WORKSPACE, "specs");
 
 /**
  * Get the memory directory for an agent.
@@ -844,10 +849,102 @@ Use this for project work, task tracking, and collaboration. Identity beads are 
   );
 }
 
+// ─── specs tool ───────────────────────────────────────────────────
+
+function registerSpecsTool(api: any) {
+  api.registerTool(
+    (ctx: { sessionKey?: string; agentId?: string }) => {
+      const agentId = ctx.agentId || "main";
+
+      return {
+        name: "specs",
+        description: `Read and write spec documents. Specs are formal markdown documents that define work for agents — PRDs, design docs, implementation plans.
+
+Specs live in workspace/specs/ and are shared across all agents.
+
+Commands:
+- read: Read a spec by name (available to all agents)
+- write: Create or replace a spec (main agent only)
+
+Specs are referenced by name (no extension needed). Main tracks which specs exist via task beads.`,
+        parameters: {
+          type: "object",
+          properties: {
+            command: {
+              type: "string",
+              enum: ["read", "write"],
+              description: "The specs command to run",
+            },
+            name: {
+              type: "string",
+              description:
+                'Spec name, e.g. "red-team". No .md extension needed.',
+            },
+            text: {
+              type: "string",
+              description:
+                "Markdown content for the spec (required for write command).",
+            },
+          },
+          required: ["command", "name"],
+        },
+
+        async execute(
+          _toolCallId: string,
+          params: { command: string; name: string; text?: string },
+        ) {
+          const { command, name, text } = params;
+
+          switch (command) {
+            case "read": {
+              const safeName = name.replace(/\.md$/i, "");
+              const specPath = join(SPECS_DIR, safeName + ".md");
+              if (!existsSync(specPath)) {
+                return errorResult(
+                  `Spec '${name}' not found. Check the bead for the correct spec name.`,
+                );
+              }
+              const content = readFileSync(specPath, "utf-8");
+              return textResult(content);
+            }
+
+            case "write": {
+              if (agentId !== "main") {
+                return errorResult(
+                  `Only the main agent can write specs. You are '${agentId}'.`,
+                );
+              }
+              if (!text) {
+                return errorResult(
+                  "'text' parameter required for write command.",
+                );
+              }
+              const safeName = name.replace(/\.md$/i, "");
+              if (!/^[a-zA-Z0-9_-]+$/.test(safeName)) {
+                return errorResult(
+                  `Invalid spec name '${safeName}'. Only letters, numbers, hyphens, and underscores are allowed.`,
+                );
+              }
+              mkdirSync(SPECS_DIR, { recursive: true });
+              const specPath = join(SPECS_DIR, safeName + ".md");
+              writeFileSync(specPath, text, "utf-8");
+              return textResult(`Spec written: specs/${safeName}.md`);
+            }
+
+            default:
+              return errorResult(`Unknown command: ${command}`);
+          }
+        },
+      };
+    },
+  );
+}
+
 // ─── Plugin entry point ───────────────────────────────────────────
 
 export default function register(api: any) {
   registerIdentityTool(api);
   registerProjectTool(api);
-  api.logger.info("bd-identity: registered agent_self + bd_project tools");
+  registerSpecsTool(api);
+  api.logger.info("bd-identity: registered agent_self + bd_project + specs tools");
 }
