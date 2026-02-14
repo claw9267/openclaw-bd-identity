@@ -421,6 +421,13 @@ Daily memory (per-agent, workspace-level — persists across sessions for the sa
 - memory_search: Search across all your daily files for a keyword/topic
 - memory_search_all: Search across ALL agents' memory files (find if anyone else encountered something)
 
+Topic beads (working memory scoped to specific tasks/topics):
+- topic_create: Create a topic bead as child of your identity bead
+- topic_list: List your open topic beads
+- topic_comment <id> <text>: Add a comment to a topic bead (with ownership check)
+- topic_show <id>: Show a topic bead with all comments
+- topic_close <id>: Auto-consolidate comments to daily notes, then close
+
 Keep your bead lean: current focus, active tasks, recent decisions. Move personality to SOUL.md, long-term lessons to agent MEMORY.md, and detailed logs to daily files.`,
         parameters: {
           type: "object",
@@ -443,13 +450,23 @@ Keep your bead lean: current focus, active tasks, recent decisions. Move persona
                 "memory_read",
                 "memory_search",
                 "memory_search_all",
+                "topic_create",
+                "topic_list",
+                "topic_comment",
+                "topic_show",
+                "topic_close",
               ],
               description: "The identity command to run",
+            },
+            id: {
+              type: "string",
+              description:
+                "Bead ID for topic_comment, topic_show, topic_close commands.",
             },
             text: {
               type: "string",
               description:
-                "Text for comment, edit, memory_write commands. Date string (YYYY-MM-DD) for memory_read. Query string for memory_search.",
+                "Text for comment, edit, memory_write, topic_create commands. Date string (YYYY-MM-DD) for memory_read. Query string for memory_search. For topic_comment: the comment text.",
             },
           },
           required: ["command"],
@@ -457,9 +474,9 @@ Keep your bead lean: current focus, active tasks, recent decisions. Move persona
 
         async execute(
           _id: string,
-          params: { command: string; text?: string },
+          params: { command: string; id?: string; text?: string },
         ) {
-          const { command, text } = params;
+          const { command, id, text } = params;
 
           if (!sessionKey) {
             return errorResult("No session context. Cannot resolve identity.");
@@ -693,6 +710,167 @@ Keep your bead lean: current focus, active tasks, recent decisions. Move persona
                 );
               const allResult = searchMeili("memory-all", text.trim());
               return textResult(allResult);
+            }
+
+            // ─── Topic bead commands ─────────────────────────
+
+            case "topic_create": {
+              if (!text)
+                return errorResult("'text' parameter required for topic_create (topic title).");
+              if (!beadId)
+                return errorResult("No identity bead found. Run 'init' first.");
+              try {
+                const newTopicId = bd([
+                  "create", text,
+                  "--prefix", "topic",
+                  "--parent", beadId,
+                  "--labels", agentId,
+                  "--silent",
+                ]);
+                return textResult(`Created topic bead: ${newTopicId} (parent: ${beadId})`);
+              } catch (e: any) {
+                return errorResult(`Failed to create topic bead: ${e.message}`);
+              }
+            }
+
+            case "topic_list": {
+              if (!beadId)
+                return errorResult("No identity bead found. Run 'init' first.");
+              try {
+                const result = bd([
+                  "query",
+                  `parent=${beadId} AND status=open`,
+                  "--json",
+                ]);
+                const beads = JSON.parse(result);
+                if (!Array.isArray(beads) || beads.length === 0) {
+                  return textResult("No open topic beads.");
+                }
+                const lines = beads.map((b: any) =>
+                  `${b.id}  ${b.title}  (${b.comment_count || 0} comments)`
+                );
+                return textResult(lines.join("\n"));
+              } catch {
+                return textResult("No open topic beads.");
+              }
+            }
+
+            case "topic_comment": {
+              if (!id)
+                return errorResult("'id' parameter required for topic_comment (bead ID).");
+              if (!text)
+                return errorResult("'text' parameter required for topic_comment (comment content).");
+              if (!beadId)
+                return errorResult("No identity bead found. Run 'init' first.");
+              const targetId = id.trim();
+              const commentText = text.trim();
+              if (!commentText)
+                return errorResult("Comment text cannot be empty.");
+              // Verify ownership: bead must be a child of this agent's identity bead
+              try {
+                const beadJson = bd(["show", targetId, "--json"]);
+                const parsed = JSON.parse(beadJson);
+                const beadData = Array.isArray(parsed) ? parsed[0] : parsed;
+                if (beadData.parent !== beadId) {
+                  return errorResult(`Topic bead ${targetId} does not belong to you.`);
+                }
+              } catch (e: any) {
+                return errorResult(`Cannot verify topic bead: ${e.message}`);
+              }
+              bd(["comments", "add", targetId, commentText]);
+              return textResult(`Comment added to ${targetId}`);
+            }
+
+            case "topic_show": {
+              if (!id)
+                return errorResult("'id' parameter required for topic_show (bead ID).");
+              if (!beadId)
+                return errorResult("No identity bead found. Run 'init' first.");
+              const showId = id.trim();
+              // Verify ownership and get bead data
+              let beadData: any;
+              try {
+                const beadJson = bd(["show", showId, "--json"]);
+                const parsed = JSON.parse(beadJson);
+                beadData = Array.isArray(parsed) ? parsed[0] : parsed;
+                if (beadData.parent !== beadId) {
+                  return errorResult(`Topic bead ${showId} does not belong to you.`);
+                }
+              } catch (e: any) {
+                return errorResult(`Cannot find topic bead: ${e.message}`);
+              }
+              // Format bead data for display from JSON
+              const showLines: string[] = [
+                `${beadData.id}: ${beadData.title || "(untitled)"}`,
+                `Status: ${beadData.status || "unknown"}  Priority: ${beadData.priority ?? "?"}  Type: ${beadData.issue_type || "?"}`,
+              ];
+              if (beadData.description) showLines.push(`\nDescription:\n${beadData.description}`);
+              if (beadData.parent) showLines.push(`Parent: ${beadData.parent}`);
+              if (beadData.labels?.length) showLines.push(`Labels: ${beadData.labels.join(", ")}`);
+              if (beadData.created_at) showLines.push(`Created: ${beadData.created_at}`);
+              if (beadData.updated_at) showLines.push(`Updated: ${beadData.updated_at}`);
+              const showOutput = showLines.join("\n");
+              let commentsOutput = "";
+              try {
+                commentsOutput = bd(["comments", showId]);
+              } catch {
+                commentsOutput = "(no comments)";
+              }
+              return textResult(`${showOutput}\n\n--- Comments ---\n\n${commentsOutput}`);
+            }
+
+            case "topic_close": {
+              if (!id)
+                return errorResult("'id' parameter required for topic_close (bead ID).");
+              if (!beadId)
+                return errorResult("No identity bead found. Run 'init' first.");
+              const closeId = id.trim();
+              // Verify ownership and get bead data
+              let topicTitle = "";
+              try {
+                const beadJson = bd(["show", closeId, "--json"]);
+                const parsed = JSON.parse(beadJson);
+                const beadData = Array.isArray(parsed) ? parsed[0] : parsed;
+                if (beadData.parent !== beadId) {
+                  return errorResult(`Topic bead ${closeId} does not belong to you.`);
+                }
+                topicTitle = beadData.title || closeId;
+              } catch (e: any) {
+                return errorResult(`Cannot find topic bead: ${e.message}`);
+              }
+              // Read comments
+              let comments: string[] = [];
+              try {
+                const commentsJson = bd(["comments", closeId, "--json"]);
+                const parsed = JSON.parse(commentsJson);
+                if (Array.isArray(parsed)) {
+                  comments = parsed.map((c: any) => c.text || String(c));
+                }
+              } catch {
+                // No comments to consolidate
+              }
+              // Format consolidation for daily notes
+              const tz = process.env.TZ || process.env.OPENCLAW_TZ || "America/Chicago";
+              const timestamp = new Date().toLocaleString("en-US", { timeZone: tz });
+              const consolidated: string[] = [
+                `## [Topic] ${topicTitle} (consolidated ${timestamp})`,
+              ];
+              if (comments.length > 0) {
+                for (const c of comments) {
+                  consolidated.push(`- ${c}`);
+                }
+              } else {
+                consolidated.push("- (no comments recorded)");
+              }
+              // Write to daily notes
+              appendToDaily(agentId, consolidated.join("\n"));
+              // Index the updated daily file
+              indexSingleDocument(agentId, todayStr());
+              // Close the bead
+              bd(["close", closeId]);
+              return textResult(
+                `Consolidated ${comments.length} comment(s) from "${topicTitle}" to daily notes. Topic closed.`
+              );
             }
 
             default:
