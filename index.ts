@@ -409,14 +409,14 @@ Commands:
 - init: Find or create your identity bead
 
 Agent-specific personality and long-term memory:
-- soul_read: Read your individual personality file (memory/<agentId>/SOUL.md)
+- soul_read: Read layered identity: central SOUL.md + agent SOUL.md + identity bead body
 - soul_write: Write/replace your personality file (memory/<agentId>/SOUL.md)
 - ltm_read: Read your long-term memory (memory/<agentId>/MEMORY.md)
 - ltm_write: Write/replace your long-term memory (memory/<agentId>/MEMORY.md) — used by nightly summarizer
 
 Daily memory (per-agent, workspace-level — persists across sessions for the same agent):
 - memory_write: Append text to today's daily file (memory/<agentId>/<year>/YYYY-MM-DD.md)
-- memory_load: Read layered memory: shared MEMORY.md → agent SOUL.md → agent MEMORY.md → yesterday → today
+- memory_load: Read layered memory: central MEMORY.md → agent MEMORY.md → open topics summary
 - memory_read: Read a specific day's daily file (pass date as text, e.g. "2026-02-07")
 - memory_search: Search across all your daily files for a keyword/topic
 - memory_search_all: Search across ALL agents' memory files (find if anyone else encountered something)
@@ -559,12 +559,45 @@ Keep your bead lean: current focus, active tasks, recent decisions. Move persona
             // ─── Agent-specific personality and memory ─────────
 
             case "soul_read": {
-              const soulPath = join(agentMemoryDir(agentId), "SOUL.md");
-              if (!existsSync(soulPath)) {
-                return textResult(`No SOUL.md file found for agent ${agentId}.`);
+              const layers: string[] = [];
+
+              // Layer 1: Central SOUL.md (shared Claw identity)
+              const centralSoulPath = join(WORKSPACE, "SOUL.md");
+              if (existsSync(centralSoulPath)) {
+                const centralSoul = readFileSync(centralSoulPath, "utf-8").trim();
+                if (centralSoul) {
+                  layers.push(`# Central Identity (Claw)\n${centralSoul}`);
+                }
               }
-              const content = readFileSync(soulPath, "utf-8");
-              return textResult(content);
+
+              // Layer 2: Agent SOUL.md (agent-specific personality)
+              const agentSoulPath = join(agentMemoryDir(agentId), "SOUL.md");
+              if (existsSync(agentSoulPath)) {
+                const agentSoul = readFileSync(agentSoulPath, "utf-8").trim();
+                if (agentSoul) {
+                  layers.push(`# Agent Identity (${agentId})\n${agentSoul}`);
+                }
+              }
+
+              // Layer 3: Identity bead body (current working state)
+              if (beadId) {
+                try {
+                  const beadJson = bd(["show", beadId, "--json"]);
+                  const beadData = Array.isArray(JSON.parse(beadJson)) ? JSON.parse(beadJson)[0] : JSON.parse(beadJson);
+                  const desc = beadData.description?.trim();
+                  if (desc) {
+                    layers.push(`# Current Working State\n${desc}`);
+                  }
+                } catch {
+                  // skip if bead can't be read
+                }
+              }
+
+              if (layers.length === 0) {
+                return textResult(`No identity layers found for agent ${agentId}. Run 'init' and set up SOUL.md files.`);
+              }
+
+              return textResult(layers.join("\n\n"));
             }
 
             case "soul_write": {
@@ -611,59 +644,42 @@ Keep your bead lean: current focus, active tasks, recent decisions. Move persona
             case "memory_load": {
               const parts: string[] = [];
 
-              // 1. Shared MEMORY.md (long-term curated memory)
+              // 1. Central MEMORY.md (system-wide experience)
               const memoryMdPath = join(WORKSPACE, "MEMORY.md");
               if (existsSync(memoryMdPath)) {
-                const content = readFileSync(memoryMdPath, "utf-8");
-                parts.push(
-                  `=== MEMORY.md (shared long-term) ===\n${content}`,
-                );
-              } else {
-                parts.push("=== MEMORY.md (shared) === (not found)");
+                const memContent = readFileSync(memoryMdPath, "utf-8").trim();
+                if (memContent) {
+                  parts.push(`# System Experience (All Agents)\n${memContent}`);
+                }
               }
 
-              // 2. Agent SOUL.md
-              const soulPath = join(agentMemoryDir(agentId), "SOUL.md");
-              if (existsSync(soulPath)) {
-                const content = readFileSync(soulPath, "utf-8");
-                parts.push(
-                  `=== SOUL.md (${agentId} personality) ===\n${content}`,
-                );
-              } else {
-                parts.push(`=== SOUL.md (${agentId}) === (not found)`);
-              }
-
-              // 3. Agent MEMORY.md
+              // 2. Agent MEMORY.md (agent-specific experience)
               const ltmPath = join(agentMemoryDir(agentId), "MEMORY.md");
               if (existsSync(ltmPath)) {
-                const content = readFileSync(ltmPath, "utf-8");
-                parts.push(
-                  `=== MEMORY.md (${agentId} long-term) ===\n${content}`,
-                );
-              } else {
-                parts.push(`=== MEMORY.md (${agentId}) === (not found)`);
+                const ltmContent = readFileSync(ltmPath, "utf-8").trim();
+                if (ltmContent) {
+                  parts.push(`# Agent Experience (${agentId})\n${ltmContent}`);
+                }
               }
 
-              // 4. Yesterday's daily file
-              const yesterday = yesterdayStr();
-              const yesterdayContent = readDailyFile(agentId, yesterday);
-              if (yesterdayContent) {
-                parts.push(
-                  `=== ${yesterday} (yesterday) ===\n${yesterdayContent}`,
-                );
-              }
-
-              // 5. Today's daily file
-              const today = todayStr();
-              const todayContent = readDailyFile(agentId, today);
-              if (todayContent) {
-                parts.push(
-                  `=== ${today} (today) ===\n${todayContent}`,
-                );
-              } else {
-                parts.push(
-                  `=== ${today} (today) === (no entries yet)`,
-                );
+              // 3. Open topics summary
+              try {
+                const topicResult = bd([
+                  "query",
+                  `label=topic AND label=${agentId} AND status=open`,
+                  "--json",
+                ]);
+                const topics = JSON.parse(topicResult);
+                if (Array.isArray(topics) && topics.length > 0) {
+                  const topicLines = topics.map((t: any) =>
+                    `- ${t.id} ${t.title} (${t.comment_count || 0} comments)`
+                  );
+                  parts.push(`# Open Topics\n${topicLines.join("\n")}`);
+                } else {
+                  parts.push("# Open Topics\nNo open topics.");
+                }
+              } catch {
+                parts.push("# Open Topics\nNo open topics.");
               }
 
               return textResult(parts.join("\n\n"));
