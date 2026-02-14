@@ -421,13 +421,6 @@ Daily memory (per-agent, workspace-level — persists across sessions for the sa
 - memory_search: Search across all your daily files for a keyword/topic
 - memory_search_all: Search across ALL agents' memory files (find if anyone else encountered something)
 
-Topic beads (working memory scoped to specific tasks/topics):
-- topic_create: Create a topic bead as child of your identity bead
-- topic_list: List your open topic beads
-- topic_comment <id> <text>: Add a comment to a topic bead (with ownership check)
-- topic_show <id>: Show a topic bead with all comments
-- topic_close <id>: Auto-consolidate comments to daily notes, then close
-
 Keep your bead lean: current focus, active tasks, recent decisions. Move personality to SOUL.md, long-term lessons to agent MEMORY.md, and detailed logs to daily files.`,
         parameters: {
           type: "object",
@@ -455,18 +448,24 @@ Keep your bead lean: current focus, active tasks, recent decisions. Move persona
                 "topic_comment",
                 "topic_show",
                 "topic_close",
+                "task_create",
+                "task_assign",
+                "task_list",
+                "task_comment",
+                "task_show",
+                "task_close",
               ],
               description: "The identity command to run",
             },
             id: {
               type: "string",
               description:
-                "Bead ID for topic_comment, topic_show, topic_close commands.",
+                "Bead ID for topic_comment, topic_show, topic_close, task_assign, task_comment, task_show, task_close commands.",
             },
             text: {
               type: "string",
               description:
-                "Text for comment, edit, memory_write, topic_create commands. Date string (YYYY-MM-DD) for memory_read. Query string for memory_search. For topic_comment: the comment text.",
+                "Text for comment, edit, memory_write, topic_create, task_create commands. Date string (YYYY-MM-DD) for memory_read. Query string for memory_search. For topic_comment/task_comment: the comment text. For task_assign: the target agent ID.",
             },
           },
           required: ["command"],
@@ -712,165 +711,250 @@ Keep your bead lean: current focus, active tasks, recent decisions. Move persona
               return textResult(allResult);
             }
 
-            // ─── Topic bead commands ─────────────────────────
+            // ─── Topic bead commands ───────────────────────
 
             case "topic_create": {
-              if (!text)
-                return errorResult("'text' parameter required for topic_create (topic title).");
-              if (!beadId)
-                return errorResult("No identity bead found. Run 'init' first.");
+              if (!text) return errorResult("'text' parameter required for topic_create.");
+              if (!beadId) return errorResult("No identity bead found. Run 'init' first.");
               try {
                 const newTopicId = bd([
                   "create", text,
-                  "--prefix", "topic",
                   "--parent", beadId,
-                  "--labels", agentId,
+                  "--labels", `${agentId},topic`,
                   "--silent",
                 ]);
-                return textResult(`Created topic bead: ${newTopicId} (parent: ${beadId})`);
+                return textResult(`Created topic: ${newTopicId}`);
               } catch (e: any) {
-                return errorResult(`Failed to create topic bead: ${e.message}`);
+                return errorResult(`Failed to create topic: ${e.message}`);
               }
             }
 
             case "topic_list": {
-              if (!beadId)
-                return errorResult("No identity bead found. Run 'init' first.");
               try {
                 const result = bd([
                   "query",
-                  `parent=${beadId} AND status=open`,
+                  `label=topic AND label=${agentId} AND status=open`,
                   "--json",
                 ]);
                 const beads = JSON.parse(result);
                 if (!Array.isArray(beads) || beads.length === 0) {
-                  return textResult("No open topic beads.");
+                  return textResult("No open topics.");
                 }
                 const lines = beads.map((b: any) =>
-                  `${b.id}  ${b.title}  (${b.comment_count || 0} comments)`
+                  `${b.id} ${b.title} (${b.comment_count || 0} comments)`
                 );
                 return textResult(lines.join("\n"));
               } catch {
-                return textResult("No open topic beads.");
+                return textResult("No open topics.");
               }
             }
 
             case "topic_comment": {
-              if (!id)
-                return errorResult("'id' parameter required for topic_comment (bead ID).");
-              if (!text)
-                return errorResult("'text' parameter required for topic_comment (comment content).");
-              if (!beadId)
-                return errorResult("No identity bead found. Run 'init' first.");
-              const targetId = id.trim();
-              const commentText = text.trim();
-              if (!commentText)
-                return errorResult("Comment text cannot be empty.");
-              // Verify ownership: bead must be a child of this agent's identity bead
+              if (!id) return errorResult("'id' parameter required for topic_comment.");
+              if (!text) return errorResult("'text' parameter required for topic_comment.");
+              // Verify ownership: must have topic + agentId labels
               try {
-                const beadJson = bd(["show", targetId, "--json"]);
-                const parsed = JSON.parse(beadJson);
-                const beadData = Array.isArray(parsed) ? parsed[0] : parsed;
-                if (beadData.parent !== beadId) {
-                  return errorResult(`Topic bead ${targetId} does not belong to you.`);
+                const beadJson = bd(["show", id, "--json"]);
+                const beadData = Array.isArray(JSON.parse(beadJson)) ? JSON.parse(beadJson)[0] : JSON.parse(beadJson);
+                const labels = beadData.labels || "";
+                if (!labels.includes("topic") || !labels.includes(agentId)) {
+                  return errorResult(`Topic ${id} does not belong to you.`);
                 }
               } catch (e: any) {
-                return errorResult(`Cannot verify topic bead: ${e.message}`);
+                return errorResult(`Cannot verify topic: ${e.message}`);
               }
-              bd(["comments", "add", targetId, commentText]);
-              return textResult(`Comment added to ${targetId}`);
+              bd(["comments", "add", id, text]);
+              return textResult(`Comment added to ${id}`);
             }
 
             case "topic_show": {
-              if (!id)
-                return errorResult("'id' parameter required for topic_show (bead ID).");
-              if (!beadId)
-                return errorResult("No identity bead found. Run 'init' first.");
-              const showId = id.trim();
-              // Verify ownership and get bead data
-              let beadData: any;
+              if (!id) return errorResult("'id' parameter required for topic_show.");
               try {
-                const beadJson = bd(["show", showId, "--json"]);
-                const parsed = JSON.parse(beadJson);
-                beadData = Array.isArray(parsed) ? parsed[0] : parsed;
-                if (beadData.parent !== beadId) {
-                  return errorResult(`Topic bead ${showId} does not belong to you.`);
+                const beadJson = bd(["show", id, "--json"]);
+                const beadData = Array.isArray(JSON.parse(beadJson)) ? JSON.parse(beadJson)[0] : JSON.parse(beadJson);
+                const labels = beadData.labels || "";
+                if (!labels.includes("topic") || !labels.includes(agentId)) {
+                  return errorResult(`Topic ${id} does not belong to you.`);
                 }
+                // Format display from JSON
+                const lines = [
+                  `${beadData.id} · ${beadData.title}   [${beadData.status || "open"}]`,
+                  `Priority: ${beadData.priority ?? "unset"}`,
+                  beadData.description ? `\nDescription:\n${beadData.description}` : "",
+                  beadData.parent ? `Parent: ${beadData.parent}` : "",
+                  `Labels: ${labels}`,
+                ].filter(Boolean);
+                const showOutput = lines.join("\n");
+                let commentsOutput = "";
+                try {
+                  commentsOutput = bd(["comments", id]);
+                } catch {
+                  commentsOutput = "(no comments)";
+                }
+                return textResult(`${showOutput}\n\n--- Comments ---\n\n${commentsOutput}`);
               } catch (e: any) {
-                return errorResult(`Cannot find topic bead: ${e.message}`);
+                return errorResult(`Cannot find topic: ${e.message}`);
               }
-              // Format bead data for display from JSON
-              const showLines: string[] = [
-                `${beadData.id}: ${beadData.title || "(untitled)"}`,
-                `Status: ${beadData.status || "unknown"}  Priority: ${beadData.priority ?? "?"}  Type: ${beadData.issue_type || "?"}`,
-              ];
-              if (beadData.description) showLines.push(`\nDescription:\n${beadData.description}`);
-              if (beadData.parent) showLines.push(`Parent: ${beadData.parent}`);
-              if (beadData.labels?.length) showLines.push(`Labels: ${beadData.labels.join(", ")}`);
-              if (beadData.created_at) showLines.push(`Created: ${beadData.created_at}`);
-              if (beadData.updated_at) showLines.push(`Updated: ${beadData.updated_at}`);
-              const showOutput = showLines.join("\n");
-              let commentsOutput = "";
-              try {
-                commentsOutput = bd(["comments", showId]);
-              } catch {
-                commentsOutput = "(no comments)";
-              }
-              return textResult(`${showOutput}\n\n--- Comments ---\n\n${commentsOutput}`);
             }
 
             case "topic_close": {
-              if (!id)
-                return errorResult("'id' parameter required for topic_close (bead ID).");
-              if (!beadId)
-                return errorResult("No identity bead found. Run 'init' first.");
-              const closeId = id.trim();
-              // Verify ownership and get bead data
-              let topicTitle = "";
+              if (!id) return errorResult("'id' parameter required for topic_close.");
+              if (!beadId) return errorResult("No identity bead found. Run 'init' first.");
               try {
-                const beadJson = bd(["show", closeId, "--json"]);
-                const parsed = JSON.parse(beadJson);
-                const beadData = Array.isArray(parsed) ? parsed[0] : parsed;
-                if (beadData.parent !== beadId) {
-                  return errorResult(`Topic bead ${closeId} does not belong to you.`);
+                const beadJson = bd(["show", id, "--json"]);
+                const beadData = Array.isArray(JSON.parse(beadJson)) ? JSON.parse(beadJson)[0] : JSON.parse(beadJson);
+                const labels = beadData.labels || "";
+                if (!labels.includes("topic") || !labels.includes(agentId)) {
+                  return errorResult(`Topic ${id} does not belong to you.`);
                 }
-                topicTitle = beadData.title || closeId;
+                // Auto-consolidate: gather comments and append to daily notes
+                let consolidation = `## Topic closed: ${beadData.title || id}\n`;
+                if (beadData.description) {
+                  consolidation += `${beadData.description}\n`;
+                }
+                try {
+                  const commentsOutput = bd(["comments", id]);
+                  if (commentsOutput) {
+                    consolidation += `\nComments:\n${commentsOutput}`;
+                  }
+                } catch {
+                  // no comments
+                }
+                appendToDaily(agentId, consolidation);
+                indexSingleDocument(agentId, todayStr());
               } catch (e: any) {
-                return errorResult(`Cannot find topic bead: ${e.message}`);
+                return errorResult(`Cannot verify topic: ${e.message}`);
               }
-              // Read comments
-              let comments: string[] = [];
+              bd(["close", id]);
+              return textResult(`Topic ${id} closed and consolidated to daily notes.`);
+            }
+
+            // ─── Task bead commands ───────────────────────────
+
+            case "task_create": {
+              if (!text) return errorResult("'text' parameter required for task_create.");
               try {
-                const commentsJson = bd(["comments", closeId, "--json"]);
-                const parsed = JSON.parse(commentsJson);
-                if (Array.isArray(parsed)) {
-                  comments = parsed.map((c: any) => c.text || String(c));
+                const newTaskId = bd([
+                  "create", text,
+                  "--labels", "task",
+                  "--silent",
+                ]);
+                return textResult(`Created task: ${newTaskId}`);
+              } catch (e: any) {
+                return errorResult(`Failed to create task: ${e.message}`);
+              }
+            }
+
+            case "task_assign": {
+              if (!id) return errorResult("'id' parameter required for task_assign.");
+              if (!text) return errorResult("'text' parameter required for task_assign (target agent ID).");
+              const targetAgentId = text.trim();
+              // Find the target agent's identity bead
+              const targetLabels = [targetAgentId];
+              const targetBeadId = findIdentityBead(targetLabels);
+              if (!targetBeadId) {
+                return errorResult(`No identity bead found for agent '${targetAgentId}'.`);
+              }
+              // Verify the bead is a task
+              try {
+                const beadJson = bd(["show", id, "--json"]);
+                const beadData = Array.isArray(JSON.parse(beadJson)) ? JSON.parse(beadJson)[0] : JSON.parse(beadJson);
+                const taskLabels = beadData.labels || "";
+                if (!taskLabels.includes("task")) {
+                  return errorResult(`${id} is not a task bead.`);
                 }
+              } catch (e: any) {
+                return errorResult(`Cannot find task: ${e.message}`);
+              }
+              // Set parent to target agent's identity bead and add agent label
+              bd(["update", id, "--parent", targetBeadId]);
+              bd(["label", "add", id, targetAgentId]);
+              return textResult(`Task ${id} assigned to ${targetAgentId} (parent: ${targetBeadId})`);
+            }
+
+            case "task_list": {
+              if (!beadId) return errorResult("No identity bead found. Run 'init' first.");
+              try {
+                const result = bd([
+                  "query",
+                  `parent=${beadId} AND label=task AND status=open`,
+                  "--json",
+                ]);
+                const beads = JSON.parse(result);
+                if (!Array.isArray(beads) || beads.length === 0) {
+                  return textResult("No open tasks assigned to you.");
+                }
+                const lines = beads.map((b: any) =>
+                  `${b.id} ${b.title}`
+                );
+                return textResult(lines.join("\n"));
               } catch {
-                // No comments to consolidate
+                return textResult("No open tasks assigned to you.");
               }
-              // Format consolidation for daily notes
-              const tz = process.env.TZ || process.env.OPENCLAW_TZ || "America/Chicago";
-              const timestamp = new Date().toLocaleString("en-US", { timeZone: tz });
-              const consolidated: string[] = [
-                `## [Topic] ${topicTitle} (consolidated ${timestamp})`,
-              ];
-              if (comments.length > 0) {
-                for (const c of comments) {
-                  consolidated.push(`- ${c}`);
+            }
+
+            case "task_comment": {
+              if (!id) return errorResult("'id' parameter required.");
+              if (!text) return errorResult("'text' parameter required.");
+              if (!beadId) return errorResult("No identity bead found. Run 'init' first.");
+              try {
+                const beadJson = bd(["show", id, "--json"]);
+                const beadData = Array.isArray(JSON.parse(beadJson)) ? JSON.parse(beadJson)[0] : JSON.parse(beadJson);
+                if (beadData.parent !== beadId) {
+                  return errorResult(`Task ${id} is not assigned to you.`);
                 }
-              } else {
-                consolidated.push("- (no comments recorded)");
+              } catch (e: any) {
+                return errorResult(`Cannot verify task: ${e.message}`);
               }
-              // Write to daily notes
-              appendToDaily(agentId, consolidated.join("\n"));
-              // Index the updated daily file
-              indexSingleDocument(agentId, todayStr());
-              // Close the bead
-              bd(["close", closeId]);
-              return textResult(
-                `Consolidated ${comments.length} comment(s) from "${topicTitle}" to daily notes. Topic closed.`
-              );
+              bd(["comments", "add", id, text]);
+              return textResult(`Comment added to ${id}`);
+            }
+
+            case "task_show": {
+              if (!id) return errorResult("'id' parameter required for task_show.");
+              if (!beadId) return errorResult("No identity bead found. Run 'init' first.");
+              try {
+                const beadJson = bd(["show", id, "--json"]);
+                const beadData = Array.isArray(JSON.parse(beadJson)) ? JSON.parse(beadJson)[0] : JSON.parse(beadJson);
+                if (beadData.parent !== beadId) {
+                  return errorResult(`Task ${id} is not assigned to you.`);
+                }
+                // Format display from JSON
+                const taskLabels = beadData.labels || "";
+                const lines = [
+                  `${beadData.id} · ${beadData.title}   [${beadData.status || "open"}]`,
+                  `Priority: ${beadData.priority ?? "unset"}`,
+                  beadData.description ? `\nDescription:\n${beadData.description}` : "",
+                  beadData.parent ? `Parent: ${beadData.parent}` : "",
+                  `Labels: ${taskLabels}`,
+                ].filter(Boolean);
+                const showOutput = lines.join("\n");
+                let commentsOutput = "";
+                try {
+                  commentsOutput = bd(["comments", id]);
+                } catch {
+                  commentsOutput = "(no comments)";
+                }
+                return textResult(`${showOutput}\n\n--- Comments ---\n\n${commentsOutput}`);
+              } catch (e: any) {
+                return errorResult(`Cannot find task: ${e.message}`);
+              }
+            }
+
+            case "task_close": {
+              if (!id) return errorResult("'id' parameter required for task_close.");
+              if (!beadId) return errorResult("No identity bead found. Run 'init' first.");
+              try {
+                const beadJson = bd(["show", id, "--json"]);
+                const beadData = Array.isArray(JSON.parse(beadJson)) ? JSON.parse(beadJson)[0] : JSON.parse(beadJson);
+                if (beadData.parent !== beadId) {
+                  return errorResult(`Task ${id} is not assigned to you.`);
+                }
+              } catch (e: any) {
+                return errorResult(`Cannot verify task: ${e.message}`);
+              }
+              bd(["close", id]);
+              return textResult(`Task ${id} closed.`);
             }
 
             default:
