@@ -8,6 +8,7 @@
  *   Gateway injects sessionKey/agentId. Agent cannot access other agents' beads or memory.
  *   Commands: whoami, show, comment, edit, comments, init,
  *             soul_read, soul_write, ltm_read, ltm_write,
+ *             system_memory_write, agent_ltm_read,
  *             memory_write, memory_load, memory_read, memory_search, memory_search_all
  *
  * bd_project — Full bead access EXCEPT identity beads.
@@ -421,6 +422,10 @@ Daily memory (per-agent, workspace-level — persists across sessions for the sa
 - memory_search: Search across all your daily files for a keyword/topic
 - memory_search_all: Search across ALL agents' memory files (find if anyone else encountered something)
 
+Nightly consolidation (main agent only):
+- system_memory_write: Write/replace the shared system MEMORY.md (main only)
+- agent_ltm_read: Read another agent's long-term memory (main only). Pass agent ID as text.
+
 Keep your bead lean: current focus, active tasks, recent decisions. Move personality to SOUL.md, long-term lessons to agent MEMORY.md, and detailed logs to daily files.`,
         parameters: {
           type: "object",
@@ -438,6 +443,8 @@ Keep your bead lean: current focus, active tasks, recent decisions. Move persona
                 "soul_write",
                 "ltm_read",
                 "ltm_write",
+                "system_memory_write",
+                "agent_ltm_read",
                 "memory_write",
                 "memory_load",
                 "memory_read",
@@ -625,6 +632,42 @@ Keep your bead lean: current focus, active tasks, recent decisions. Move persona
               writeFileSync(ltmPath, text, "utf-8");
               const relPath = relative(WORKSPACE, ltmPath);
               return textResult(`Written to ${relPath}`);
+            }
+
+            case "system_memory_write": {
+              if (agentId !== "main") {
+                return errorResult(
+                  `Only the main agent can write system MEMORY.md. You are '${agentId}'.`,
+                );
+              }
+              if (!text)
+                return errorResult("'text' parameter required for system_memory_write.");
+              const sysMemPath = join(WORKSPACE, "MEMORY.md");
+              writeFileSync(sysMemPath, text, "utf-8");
+              return textResult(`Written to MEMORY.md (system-wide shared memory)`);
+            }
+
+            case "agent_ltm_read": {
+              if (agentId !== "main") {
+                return errorResult(
+                  `Only the main agent can read other agents' LTM. You are '${agentId}'.`,
+                );
+              }
+              if (!text)
+                return errorResult("'text' parameter required for agent_ltm_read (target agent ID).");
+              const targetId = text.trim();
+              // Validate agent ID to prevent path traversal
+              if (!/^[a-zA-Z0-9_-]+$/.test(targetId)) {
+                return errorResult(
+                  `Invalid agent ID '${targetId}'. Only letters, numbers, hyphens, and underscores are allowed.`,
+                );
+              }
+              const targetLtmPath = join(MEMORY_ROOT, targetId, "MEMORY.md");
+              if (!existsSync(targetLtmPath)) {
+                return textResult(`No MEMORY.md found for agent '${targetId}'. They may not have consolidated yet.`);
+              }
+              const targetContent = readFileSync(targetLtmPath, "utf-8");
+              return textResult(targetContent);
             }
 
             // ─── Workspace memory commands ────────────────────
