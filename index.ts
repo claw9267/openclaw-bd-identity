@@ -41,12 +41,15 @@ const IDENTITY_LABEL = "agent-identity";
 
 function bd(args: string[], timeoutMs = 10000): string {
   const result = spawnSync("bd", args, {
+    cwd: WORKSPACE,
     encoding: "utf-8",
     timeout: timeoutMs,
   });
   if (result.status !== 0) {
     const msg = result.stderr?.trim() || result.error?.message || "unknown error";
-    throw new Error(`bd failed: ${msg}`);
+    const signal = result.signal || "none";
+    console.error(`[bd-identity] bd ${args.join(" ")} → status=${result.status} signal=${signal} error=${msg}`);
+    throw new Error(`bd failed (signal=${signal}): ${msg}`);
   }
   return (result.stdout || "").trim();
 }
@@ -55,7 +58,8 @@ function isIdentityBead(beadId: string): boolean {
   try {
     const result = bd(["label", "list", beadId]);
     return result.includes(IDENTITY_LABEL);
-  } catch {
+  } catch (e: any) {
+    console.error(`[bd-identity] createIdentityBead failed for "${label}":`, e?.message || e);
     return false;
   }
 }
@@ -279,16 +283,55 @@ function indexSingleDocument(agentId: string, dateStr: string): void {
 
     // Update agent-specific index
     execSync(
-      `curl -sf -X POST "${MEILI_URL}/indexes/memory-${agentId}/documents" -H 'Content-Type: application/json' --data-binary @-`,
+      `curl -sf -X POST "${MEILI_URL}/indexes/memory-${agentId}/documents?primaryKey=id" -H 'Content-Type: application/json' --data-binary @-`,
       { encoding: "utf-8", timeout: 5000, input: doc, stdio: ["pipe", "pipe", "pipe"] },
     );
 
     // Update combined index
     execSync(
-      `curl -sf -X POST "${MEILI_URL}/indexes/memory-all/documents" -H 'Content-Type: application/json' --data-binary @-`,
+      `curl -sf -X POST "${MEILI_URL}/indexes/memory-all/documents?primaryKey=id" -H 'Content-Type: application/json' --data-binary @-`,
       { encoding: "utf-8", timeout: 5000, input: doc, stdio: ["pipe", "pipe", "pipe"] },
     );
-  } catch {
+  } catch (e: any) {
+    console.error(`[bd-identity] createIdentityBead failed for "${label}":`, e?.message || e);
+    // Best effort — don't block on indexing failures
+  }
+}
+/**
+ * Index any memory file (LTM, system MEMORY.md) into MeiliSearch.
+ * Used for ltm_write and system_memory_write.
+ */
+function indexFileDocument(filepath: string, agentId: string, indexName: string): void {
+  try {
+    if (!existsSync(filepath)) return;
+    const fileContent = readFileSync(filepath, "utf-8").trim();
+    if (!fileContent) return;
+
+    const relPath = relative(WORKSPACE, filepath);
+    const docId = relPath.replace(/[^a-zA-Z0-9]/g, "-");
+    const filename = filepath.split("/").pop() || "";
+
+    const doc = JSON.stringify([{
+      id: docId,
+      agentId,
+      date: "ltm",
+      path: relPath,
+      filename,
+      content: fileContent,
+    }]);
+
+    // Update specified index
+    execSync(
+      `curl -sf -X POST "${MEILI_URL}/indexes/${indexName}/documents?primaryKey=id" -H 'Content-Type: application/json' --data-binary @-`,
+      { encoding: "utf-8", timeout: 5000, input: doc, stdio: ["pipe", "pipe", "pipe"] },
+    );
+
+    // Update combined index
+    execSync(
+      `curl -sf -X POST "${MEILI_URL}/indexes/memory-all/documents?primaryKey=id" -H 'Content-Type: application/json' --data-binary @-`,
+      { encoding: "utf-8", timeout: 5000, input: doc, stdio: ["pipe", "pipe", "pipe"] },
+    );
+  } catch (e: any) {
     // Best effort — don't block on indexing failures
   }
 }
@@ -334,7 +377,8 @@ function findIdentityBead(searchLabels: string[]): string | null {
       if (Array.isArray(beads) && beads.length > 0 && beads[0].id) {
         return beads[0].id;
       }
-    } catch {
+    } catch (e: any) {
+    console.error(`[bd-identity] createIdentityBead failed for "${label}":`, e?.message || e);
       // next
     }
   }
@@ -353,7 +397,8 @@ function findIdentityBead(searchLabels: string[]): string | null {
           );
           if (match?.id) return match.id;
         }
-      } catch {
+      } catch (e: any) {
+    console.error(`[bd-identity] createIdentityBead failed for "${label}":`, e?.message || e);
         // fall through
       }
     }
@@ -379,7 +424,8 @@ function createIdentityBead(label: string): string | null {
       ]);
     }
     return id || null;
-  } catch {
+  } catch (e: any) {
+    console.error(`[bd-identity] createIdentityBead failed for "${label}":`, e?.message || e);
     return null;
   }
 }
@@ -426,7 +472,26 @@ Nightly consolidation (main agent only):
 - system_memory_write: Write/replace the shared system MEMORY.md (main only)
 - agent_ltm_read: Read another agent's long-term memory (main only). Pass agent ID as text.
 
-Keep your bead lean: current focus, active tasks, recent decisions. Move personality to SOUL.md, long-term lessons to agent MEMORY.md, and detailed logs to daily files.`,
+Short-term working memory (topics — your lifeline):
+- topic_create: Create a topic for active work. One per work stream.
+- topic_list: List your open topics
+- topic_comment: Comment on a topic CONTINUOUSLY while working — decisions, findings, changes. This is how you resume if a session dies.
+- topic_show: Show a topic with all comments
+- topic_close: Close a topic when done (auto-consolidates comments to daily notes)
+
+Tasks (todos — work items for now or later):
+- task_create: Create a task (backlog by default, add #ready or #trivial to skip backlog)
+- task_assign: Assign a task to an agent (sets parent to their identity bead)
+- task_list: List tasks. Pass ready (bosun's queue), backlog, all (active, excludes backlog), or label:<name>. Default: tasks assigned to you.
+- task_promote: Promote a backlog task to ready (requires spec reference unless #trivial). Main agent only.
+- task_comment: Comment on a task — implementation details and considerations about the task itself (not working memory)
+- task_show: Show a task with comments
+- task_close: Close a completed task
+
+Identity bead = who you are (experiential identity, layered on SOUL.md). NOT working memory.
+Topics = short-term working memory (your lifeline). Comment continuously while working.
+Tasks = todos. Create a topic when you start working a task.
+Daily notes = permanent lab notebook. Topics auto-consolidate here on close.`,
         parameters: {
           type: "object",
           properties: {
@@ -458,6 +523,7 @@ Keep your bead lean: current focus, active tasks, recent decisions. Move persona
                 "task_create",
                 "task_assign",
                 "task_list",
+                "task_promote",
                 "task_comment",
                 "task_show",
                 "task_close",
@@ -472,7 +538,7 @@ Keep your bead lean: current focus, active tasks, recent decisions. Move persona
             text: {
               type: "string",
               description:
-                "Text for comment, edit, memory_write, topic_create, task_create commands. Date string (YYYY-MM-DD) for memory_read. Query string for memory_search. For topic_comment/task_comment: the comment text. For task_assign: the target agent ID.",
+                "Text for comment, edit, memory_write, topic_create, task_create commands. For task_create: append #labels like 'title #security-finding #urgent'. For task_list: pass ready, backlog, all, unassigned, or label:<name> to filter (default: tasks assigned to you). Date string (YYYY-MM-DD) for memory_read. Query string for memory_search. For topic_comment/task_comment: the comment text. For task_assign: the target agent ID.",
             },
           },
           required: ["command"],
@@ -540,7 +606,8 @@ Keep your bead lean: current focus, active tasks, recent decisions. Move persona
               try {
                 const output = bd(["comments", beadId]);
                 return textResult(output || "No comments.");
-              } catch {
+              } catch (e: any) {
+    console.error(`[bd-identity] createIdentityBead failed for "${label}":`, e?.message || e);
                 return textResult("No comments.");
               }
             }
@@ -595,7 +662,8 @@ Keep your bead lean: current focus, active tasks, recent decisions. Move persona
                   if (desc) {
                     layers.push(`# Current Working State\n${desc}`);
                   }
-                } catch {
+                } catch (e: any) {
+    console.error(`[bd-identity] createIdentityBead failed for "${label}":`, e?.message || e);
                   // skip if bead can't be read
                 }
               }
@@ -613,6 +681,7 @@ Keep your bead lean: current focus, active tasks, recent decisions. Move persona
               const soulPath = join(agentMemoryDir(agentId), "SOUL.md");
               writeFileSync(soulPath, text, "utf-8");
               const relPath = relative(WORKSPACE, soulPath);
+              indexFileDocument(ltmPath, agentId, `memory-${agentId}`);
               return textResult(`Written to ${relPath}`);
             }
 
@@ -644,6 +713,7 @@ Keep your bead lean: current focus, active tasks, recent decisions. Move persona
                 return errorResult("'text' parameter required for system_memory_write.");
               const sysMemPath = join(WORKSPACE, "MEMORY.md");
               writeFileSync(sysMemPath, text, "utf-8");
+              indexFileDocument(sysMemPath, "system", "memory-system");
               return textResult(`Written to MEMORY.md (system-wide shared memory)`);
             }
 
@@ -721,7 +791,8 @@ Keep your bead lean: current focus, active tasks, recent decisions. Move persona
                 } else {
                   parts.push("# Open Topics\nNo open topics.");
                 }
-              } catch {
+              } catch (e: any) {
+    console.error(`[bd-identity] createIdentityBead failed for "${label}":`, e?.message || e);
                 parts.push("# Open Topics\nNo open topics.");
               }
 
@@ -803,7 +874,8 @@ Keep your bead lean: current focus, active tasks, recent decisions. Move persona
                   `${b.id} ${b.title} (${b.comment_count || 0} comments)`
                 );
                 return textResult(lines.join("\n"));
-              } catch {
+              } catch (e: any) {
+    console.error(`[bd-identity] createIdentityBead failed for "${label}":`, e?.message || e);
                 return textResult("No open topics.");
               }
             }
@@ -847,7 +919,8 @@ Keep your bead lean: current focus, active tasks, recent decisions. Move persona
                 let commentsOutput = "";
                 try {
                   commentsOutput = bd(["comments", id]);
-                } catch {
+                } catch (e: any) {
+    console.error(`[bd-identity] createIdentityBead failed for "${label}":`, e?.message || e);
                   commentsOutput = "(no comments)";
                 }
                 return textResult(`${showOutput}\n\n--- Comments ---\n\n${commentsOutput}`);
@@ -866,20 +939,9 @@ Keep your bead lean: current focus, active tasks, recent decisions. Move persona
                 if (!labels.includes("topic") || !labels.includes(agentId)) {
                   return errorResult(`Topic ${id} does not belong to you.`);
                 }
-                // Auto-consolidate: gather comments and append to daily notes
-                let consolidation = `## Topic closed: ${beadData.title || id}\n`;
-                if (beadData.description) {
-                  consolidation += `${beadData.description}\n`;
-                }
-                try {
-                  const commentsOutput = bd(["comments", id]);
-                  if (commentsOutput) {
-                    consolidation += `\nComments:\n${commentsOutput}`;
-                  }
-                } catch {
-                  // no comments
-                }
-                appendToDaily(agentId, consolidation);
+                // Record topic closure in daily notes (ID only — agent should write summary separately)
+                const closureNote = `## Topic closed: ${beadData.title || id} (${id})`;
+                appendToDaily(agentId, closureNote);
                 indexSingleDocument(agentId, todayStr());
               } catch (e: any) {
                 return errorResult(`Cannot verify topic: ${e.message}`);
@@ -893,12 +955,32 @@ Keep your bead lean: current focus, active tasks, recent decisions. Move persona
             case "task_create": {
               if (!text) return errorResult("'text' parameter required for task_create.");
               try {
+                // Parse #hashtag labels from end of text
+                const hashtagRegex = /\s+#([\w-]+)/g;
+                const extraLabels: string[] = [];
+                let title = text;
+                let match;
+                while ((match = hashtagRegex.exec(text)) !== null) {
+                  extraLabels.push(match[1]);
+                }
+                if (extraLabels.length > 0) {
+                  title = text.replace(/\s+#[\w-]+/g, "").trim();
+                }
+                // Default to backlog unless #ready or #trivial is specified
+                const hasReady = extraLabels.includes("ready");
+                const hasTrivial = extraLabels.includes("trivial");
+                const hasBacklog = extraLabels.includes("backlog");
+                if (!hasReady && !hasBacklog) {
+                  extraLabels.push("backlog");
+                }
+                const allLabels = ["task", ...extraLabels].join(",");
                 const newTaskId = bd([
-                  "create", text,
-                  "--labels", "task",
+                  "create", title,
+                  "--labels", allLabels,
                   "--silent",
                 ]);
-                return textResult(`Created task: ${newTaskId}`);
+                const status = hasReady ? "ready" : (hasTrivial ? "backlog (trivial)" : "backlog");
+                return textResult(`Created task: ${newTaskId} [${status}]`);
               } catch (e: any) {
                 return errorResult(`Failed to create task: ${e.message}`);
               }
@@ -934,21 +1016,150 @@ Keep your bead lean: current focus, active tasks, recent decisions. Move persona
             case "task_list": {
               if (!beadId) return errorResult("No identity bead found. Run 'init' first.");
               try {
+                const mode = (text || "").trim().toLowerCase();
+                let query: string;
+                let emptyMsg: string;
+                let filterMode: "ready" | "backlog" | "all" | "unassigned" | "mine" | "label" = "mine";
+
+                // Support label filtering: "label:foo" or "label:foo,bar"
+                const labelMatch = mode.match(/^label:([\w,-]+)$/);
+                if (labelMatch) {
+                  filterMode = "label";
+                  const labelFilters = labelMatch[1].split(",").map((l: string) => `label=${l}`).join(" AND ");
+                  query = `${labelFilters} AND label=task AND status=open`;
+                  emptyMsg = `No open tasks with label: ${labelMatch[1]}`;
+                } else if (mode === "ready") {
+                  // Tasks promoted to ready (bosun's shopping list)
+                  filterMode = "ready";
+                  query = "label=task AND label=ready AND status=open";
+                  emptyMsg = "No ready tasks.";
+                } else if (mode === "backlog") {
+                  // Backlog tasks (parked, not yet ready)
+                  filterMode = "backlog";
+                  query = "label=task AND label=backlog AND status=open";
+                  emptyMsg = "No backlog tasks.";
+                } else if (mode === "all") {
+                  // All active tasks (excludes backlog)
+                  filterMode = "all";
+                  query = "label=task AND status=open";
+                  emptyMsg = "No open tasks.";
+                } else if (mode === "unassigned") {
+                  // Tasks not assigned to any agent (no parent)
+                  filterMode = "unassigned";
+                  query = "label=task AND status=open";
+                  emptyMsg = "No unassigned tasks.";
+                } else {
+                  // Default: tasks assigned to this agent
+                  filterMode = "mine";
+                  query = `parent=${beadId} AND label=task AND status=open`;
+                  emptyMsg = "No open tasks assigned to you.";
+                }
+
                 const result = bd([
                   "query",
-                  `parent=${beadId} AND label=task AND status=open`,
+                  query,
                   "--json",
                 ]);
                 const beads = JSON.parse(result);
                 if (!Array.isArray(beads) || beads.length === 0) {
-                  return textResult("No open tasks assigned to you.");
+                  return textResult(emptyMsg);
                 }
-                const lines = beads.map((b: any) =>
-                  `${b.id} ${b.title}`
-                );
+
+                // Detect agent ownership from labels
+                const agentIds = ["main", "forge", "scout", "courier", "watchdog", "bosun"];
+                const getOwner = (b: any): string | null => {
+                  const labels: string[] = b.labels || [];
+                  const agentLabels = labels.filter((l: string) => agentIds.includes(l));
+                  return agentLabels.length > 0 ? agentLabels[0] : null;
+                };
+
+                const hasLabel = (b: any, label: string): boolean => {
+                  const labels: string[] = b.labels || [];
+                  return labels.includes(label);
+                };
+
+                let filtered = beads;
+
+                // For "all" mode, exclude backlog tasks
+                if (filterMode === "all") {
+                  filtered = beads.filter((b: any) => !hasLabel(b, "backlog"));
+                }
+
+                // For "unassigned" mode, filter to tasks with no agent label
+                if (filterMode === "unassigned") {
+                  filtered = beads.filter((b: any) => !getOwner(b) && !hasLabel(b, "backlog"));
+                }
+
+                if (filtered.length === 0) {
+                  return textResult(emptyMsg);
+                }
+
+                // Format output with context
+                const lines = filtered.map((b: any) => {
+                  const ownerAgent = getOwner(b);
+                  const statusLabels: string[] = [];
+                  if (hasLabel(b, "backlog")) statusLabels.push("backlog");
+                  if (hasLabel(b, "ready")) statusLabels.push("ready");
+                  if (hasLabel(b, "in-progress")) statusLabels.push("in-progress");
+                  if (hasLabel(b, "trivial")) statusLabels.push("trivial");
+                  const statusTag = statusLabels.length > 0 ? ` {${statusLabels.join(",")}}` : "";
+
+                  if (filterMode === "mine") {
+                    return `${b.id} ${b.title}${statusTag}`;
+                  }
+                  const ownerTag = ownerAgent ? ` [${ownerAgent}]` : " [unassigned]";
+                  return `${b.id} ${b.title}${ownerTag}${statusTag}`;
+                });
                 return textResult(lines.join("\n"));
-              } catch {
-                return textResult("No open tasks assigned to you.");
+              } catch (e: any) {
+                return textResult("No open tasks.");
+              }
+            }
+
+            case "task_promote": {
+              if (!id) return errorResult("'id' parameter required for task_promote.");
+              if (agentId !== "main") {
+                return errorResult(`Only the main agent can promote tasks. You are '${agentId}'.`);
+              }
+              try {
+                const beadJson = bd(["show", id, "--json"]);
+                const beadData = Array.isArray(JSON.parse(beadJson)) ? JSON.parse(beadJson)[0] : JSON.parse(beadJson);
+                const taskLabels: string[] = beadData.labels || [];
+                if (!taskLabels.includes("task")) {
+                  return errorResult(`${id} is not a task bead.`);
+                }
+                if (!taskLabels.includes("backlog")) {
+                  return errorResult(`${id} is not in backlog.`);
+                }
+                if (taskLabels.includes("ready")) {
+                  return errorResult(`${id} is already ready.`);
+                }
+                // Check for spec or trivial bypass
+                const isTrivial = taskLabels.includes("trivial");
+                if (!isTrivial) {
+                  const desc = (beadData.description || "").toLowerCase();
+                  const title = (beadData.title || "").toLowerCase();
+                  const hasSpecRef = desc.includes("spec") || desc.includes("specs/") || title.includes("spec");
+                  if (!hasSpecRef && !text) {
+                    return errorResult(
+                      `Task ${id} needs a spec reference before promotion. Either:\n` +
+                      `- Add a spec reference: task_promote with text="spec: <spec-name>"\n` +
+                      `- Or label it #trivial if no spec is needed.`
+                    );
+                  }
+                  // If text provided, add it as spec reference in description
+                  if (text) {
+                    const currentDesc = beadData.description || "";
+                    const newDesc = currentDesc ? `${currentDesc}\n\nSpec: ${text}` : `Spec: ${text}`;
+                    bd(["update", id, "--description", newDesc]);
+                  }
+                }
+                // Remove backlog, add ready
+                bd(["label", "remove", id, "backlog"]);
+                bd(["label", "add", id, "ready"]);
+                return textResult(`Task ${id} promoted to ready.`);
+              } catch (e: any) {
+                return errorResult(`Failed to promote task: ${e.message}`);
               }
             }
 
@@ -991,7 +1202,8 @@ Keep your bead lean: current focus, active tasks, recent decisions. Move persona
                 let commentsOutput = "";
                 try {
                   commentsOutput = bd(["comments", id]);
-                } catch {
+                } catch (e: any) {
+    console.error(`[bd-identity] createIdentityBead failed for "${label}":`, e?.message || e);
                   commentsOutput = "(no comments)";
                 }
                 return textResult(`${showOutput}\n\n--- Comments ---\n\n${commentsOutput}`);
@@ -1009,6 +1221,10 @@ Keep your bead lean: current focus, active tasks, recent decisions. Move persona
                 if (beadData.parent !== beadId) {
                   return errorResult(`Task ${id} is not assigned to you.`);
                 }
+                // Record task closure in daily notes (ID only — agent should write summary separately)
+                const taskClosureNote = `## Task closed: ${beadData.title || id} (${id})`;
+                appendToDaily(agentId, taskClosureNote);
+                indexSingleDocument(agentId, todayStr());
               } catch (e: any) {
                 return errorResult(`Cannot verify task: ${e.message}`);
               }
